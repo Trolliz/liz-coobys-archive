@@ -26,7 +26,7 @@ const catLabel = (c) => CAT_LABEL[c] || (c || '').replace(/_/g, ' ');
 function toast(msg, ms = 2600) { const t = $('#toast'); t.textContent = msg; t.hidden = false; clearTimeout(toast.t); toast.t = setTimeout(() => t.hidden = true, ms); }
 
 /* ---------- state ---------- */
-const S = { owner: null, threads: null, report: null, searchIdx: null, urls: [], busy: false };
+const S = { owner: null, threads: null, report: null, searchIdx: null, urls: [], busy: false, profile: null, profiles: [], searchScope: 'this', xcache: new Map() };
 async function loadState(force) {
   if (!S.threads || force) {
     S.threads = (await LCA.getAll('threads')).sort((a, b) => (b.lastTs || 0) - (a.lastTs || 0));
@@ -69,11 +69,11 @@ async function shareMedia(id) {
 
 /* ---------- avatars (saved page pictures, cached on this device) ---------- */
 const avCache = new Map();
-function avatar(name, url, sq) {
+function avatar(name, url, sq, L) {
   const el = h('div', { class: 'av' + (sq ? ' sq' : '') }, initials(name));
   if (url) (async () => {
     let u = avCache.get(url);
-    if (!u) { const r = await LCA.get('avatars', url).catch(() => null); if (r && r.blob) { u = URL.createObjectURL(r.blob); avCache.set(url, u); } }
+    if (!u) { const r = await (L || LCA).get('avatars', url).catch(() => null); if (r && r.blob) { u = URL.createObjectURL(r.blob); avCache.set(url, u); } }
     const img = h('img', { alt: '', referrerpolicy: 'no-referrer', decoding: 'async' });
     img.onerror = () => img.remove();
     img.onload = () => { el.textContent = ''; el.append(img); };
@@ -81,14 +81,14 @@ function avatar(name, url, sq) {
   })();
   return el;
 }
-async function cacheAvatars(urls, label) {
+async function cacheAvatars(urls, label, L) {
   const todo = [...new Set(urls.filter(Boolean))]; let ok = 0, fail = 0, i = 0;
-  const have = new Set((await LCA.getAll('avatars')).filter(a => a.blob).map(a => a.url));
+  const have = new Set((await L.getAll('avatars')).filter(a => a.blob).map(a => a.url));
   const list = todo.filter(u => !have.has(u)); ok = todo.length - list.length;
   async function one() {
     while (i < list.length) {
       const u = list[i++];
-      try { const r = await fetch(u, { mode: 'cors', credentials: 'omit', referrerPolicy: 'no-referrer' }); if (!r.ok) throw 0; const b = await r.blob(); await LCA.put('avatars', { url: u, blob: b, savedAt: Date.now() }); ok++; }
+      try { const r = await fetch(u, { mode: 'cors', credentials: 'omit', referrerPolicy: 'no-referrer' }); if (!r.ok) throw 0; const b = await r.blob(); await L.put('avatars', { url: u, blob: b, savedAt: Date.now() }); ok++; }
       catch (e) { fail++; }
       if ((ok + fail) % 20 === 0) setProgress(`Saving ${label} pictures for offline use`, ok + fail, todo.length);
     }
@@ -101,12 +101,13 @@ async function cacheAvatars(urls, label) {
 let worker = null, workerDone = null;
 function getWorker() {
   if (worker) return worker;
-  worker = new Worker('worker.js');
+  worker = new Worker('worker.js?v=5');
   worker.onmessage = async (e) => {
     const d = e.data;
     if (d.type === 'progress') setProgress(d.phase, d.done, d.total, d.note);
     else if (d.type === 'parseMessageHtml') worker.postMessage({ type: 'reply', id: d.id, result: safe(() => Parsers.parseMessageHtml(d.text)) });
     else if (d.type === 'parseHtmlList') worker.postMessage({ type: 'reply', id: d.id, result: safe(() => Parsers.parseHtmlList(d.text)) });
+    else if (d.type === 'confirmProfile') worker.postMessage({ type: 'reply', id: d.id, result: await confirmProfileName(d.name).catch(() => true) });
     else if (d.type === 'isBackup') { workerDone && workerDone.resolve({ backup: true }); }
     else if (d.type === 'done' || d.type === 'backupReady') { workerDone && workerDone.resolve(d.type === 'done' ? (d.result || {}) : d); }
     else if (d.type === 'error') { workerDone && workerDone.reject(new Error(d.message)); }
@@ -144,9 +145,11 @@ async function checkSpace(bytes) {
 async function importFiles(fileList) {
   if (S.busy) return toast('An import is already running');
   const files = [...fileList]; if (!files.length) return;
-  S.busy = true; $('#statusBtn')?.classList.add('attn');
+  // everything below writes only into the profile that was selected when the import started (switching is locked meanwhile)
+  const P = S.profile, L = LCA.at(P.db);
+  S.busy = true; $('#statusBtn')?.classList.add('attn'); drawProfileBtn();
   const prog = $('#prog'); if (prog) prog.hidden = false;
-  const log = [];
+  const log = []; let backupFile = null, foundName = null;
   try {
     await askPersist();
     const isAsset = (f) => /_files\//.test(f.webkitRelativePath || '');
@@ -156,53 +159,53 @@ async function importFiles(fileList) {
     if (!(await checkSpace(zips.reduce((a, f) => a + f.size, 0)))) throw new Error('Import cancelled');
     if (zips.length) {
       setProgress('Reading ZIP', 0, 1);
-      const r = await runWorker({ type: 'importZips', files: zips });
-      if (r && r.backup) {
-        if (confirm('This file is a Liz Coobys Archive backup. Restore it? This replaces everything currently stored in the app.')) {
-          await runWorker({ type: 'restore', file: zips[0] }); log.push('Backup restored.');
-        }
-      } else log.push(`Facebook export imported: ${zips.map(z => z.name).join(', ')}`);
+      const r = await runWorker({ type: 'importZips', files: zips, db: P.db });
+      if (r && r.backup) { backupFile = zips[0]; log.push('That file is a Liz Coobys Archive backup – see the restore options.'); }
+      else if (r && r.cancelled) log.push(`Import stopped before anything was saved (export belongs to “${r.profileName}”).`);
+      else { log.push(`Facebook export imported into “${P.name}”: ${zips.map(z => z.name).join(', ')}`); foundName = r && r.profileName; }
     }
     for (const f of htmls) {
       setProgress('Reading ' + f.name, 0, 1);
       const txt = await f.text();
       const res = Parsers.parseSaved(txt, f.name);
-      if (!res.kind) { await noteIgnored([{ path: f.name, size: f.size, reason: 'HTML file not recognised as a saved friends / groups / pages page' }]); log.push(`${f.name}: not recognised`); continue; }
-      const n = await storeSaved(res, f.name);
+      if (!res.kind) { await noteIgnored(L, [{ path: f.name, size: f.size, reason: 'HTML file not recognised as a saved friends / groups / pages page' }]); log.push(`${f.name}: not recognised`); continue; }
+      const n = await storeSaved(L, res, f.name);
       log.push(`${f.name}: ${n} ${res.kind} read`);
       setProgress('Saving pictures', 0, 1);
-      const av = await cacheAvatars(res.items.map(i => i.image), res.kind);
-      const rep = await LCA.getMeta('report', null) || {}; rep.saved = rep.saved || {}; rep.saved[res.kind].avatars = av; await LCA.setMeta('report', rep);
+      const av = await cacheAvatars(res.items.map(i => i.image), res.kind, L);
+      const rep = await L.getMeta('report', null) || {}; rep.saved = rep.saved || {}; rep.saved[res.kind].avatars = av; await L.setMeta('report', rep);
       log.push(`${av.ok} of ${av.total} pictures saved offline` + (av.fail ? ` (${av.fail} could not be downloaded – these show initials)` : ''));
     }
     if (others.length) {
-      await noteIgnored(others.map(f => ({ path: f.webkitRelativePath || f.name, size: f.size, reason: isAsset(f) || /\.(js|css|download)$/i.test(f.name) ? 'saved-web-page asset (scripts/styles – no archive data)' : 'unsupported file type' })));
+      await noteIgnored(L, others.map(f => ({ path: f.webkitRelativePath || f.name, size: f.size, reason: isAsset(f) || /\.(js|css|download)$/i.test(f.name) ? 'saved-web-page asset (scripts/styles – no archive data)' : 'unsupported file type' })));
       log.push(`${others.length} other file(s) listed in the report (no archive data in them)`);
     }
-    await loadState(true);
+    S.xcache.clear(); await loadState(true);
     setProgress('Done', 1, 1, log.join(' · '));
-    toast('Import finished');
+    toast(backupFile ? 'Backup file found' : 'Import finished');
+    if (foundName && normName(foundName) !== normName(P.name)) toast(`This export belongs to “${foundName}” – you can rename the profile below`, 5000);
   } catch (e) {
     console.error(e); setProgress('Import stopped', 0, 1, e.message);
     alert('Import problem: ' + e.message + (/quota|space|full/i.test(e.message) ? '\n\nThe device seems to be out of storage space.' : ''));
   } finally {
-    S.busy = false; $('#statusBtn')?.classList.remove('attn'); await loadState(true);
+    S.busy = false; $('#statusBtn')?.classList.remove('attn'); drawProfileBtn(); await loadState(true);
     if (location.hash.startsWith('#/import')) { const note = $('#progNote')?.textContent; await render(); setProgress('Done', 1, 1, note); }
   }
+  if (backupFile) await restoreFlow(backupFile);
 }
-async function noteIgnored(list) {
-  const rep = await LCA.getMeta('report', null) || {}; rep.ignoredUploads = (rep.ignoredUploads || []).concat(list).slice(-5000);
-  await LCA.setMeta('report', rep);
+async function noteIgnored(L, list) {
+  const rep = await L.getMeta('report', null) || {}; rep.ignoredUploads = (rep.ignoredUploads || []).concat(list).slice(-5000);
+  await L.setMeta('report', rep);
 }
-async function storeSaved(res, fileName) {
+async function storeSaved(L, res, fileName) {
   const store = res.kind;
-  const old = (await LCA.getAll(store)).filter(r => r.source === 'page');
-  for (const o of old) await LCA.del(store, o.id);
+  const old = (await L.getAll(store)).filter(r => r.source === 'page');
+  for (const o of old) await L.del(store, o.id);
   const recs = res.items.map((x, i) => Object.assign({}, x, { id: 'page:' + x.key, source: 'page', file: fileName, order: i }));
-  await LCA.putMany(store, recs);
-  const rep = await LCA.getMeta('report', null) || {};
+  await L.putMany(store, recs);
+  const rep = await L.getMeta('report', null) || {};
   rep.saved = rep.saved || {}; rep.saved[store] = { file: fileName, savedFrom: res.savedFrom, statedTotal: res.statedTotal, items: recs.length, importedAt: Date.now() };
-  await LCA.setMeta('report', rep);
+  await L.setMeta('report', rep);
   return recs.length;
 }
 
@@ -210,9 +213,17 @@ async function storeSaved(res, fileName) {
 window.addEventListener('hashchange', render);
 $('#searchForm').addEventListener('submit', (e) => { e.preventDefault(); const q = $('#q').value.trim(); if (q) location.hash = '#/search/' + encodeURIComponent(q); $('#q').blur(); });
 async function render() {
+  if (!S.profile) return; // still starting up
   revokeAll();
   const parts = (location.hash || '#/messenger').slice(2).split('/');
   const tab = parts[0] || 'messenger';
+  // #/go/<profileId>/<rest>: open something that belongs to another profile (from "all profiles" search)
+  if (tab === 'go') {
+    const rest = '#/' + parts.slice(2).join('/');
+    if (parts[1] && parts[1] !== S.profile.id && S.profiles.some(p => p.id === parts[1])) { if (!(await switchProfile(parts[1], rest, true))) history.back(); }
+    else location.replace(rest);
+    return;
+  }
   document.body.classList.toggle('chat', tab === 'thread');
   for (const a of document.querySelectorAll('#nav a')) a.classList.toggle('on', a.dataset.tab === tab || (tab === 'thread' && a.dataset.tab === 'messenger'));
   await loadState();
@@ -230,7 +241,7 @@ async function render() {
   if (tab !== 'thread') window.scrollTo(0, 0);
 }
 function emptyState(what) {
-  return h('div', { class: 'card empty' }, h('div', { style: 'font-size:42px' }, '🐾'), h('p', null, `No ${what} imported yet.`),
+  return h('div', { class: 'card empty' }, h('div', { style: 'font-size:42px' }, S.profile?.icon || '🐾'), h('p', null, `No ${what} imported yet in the profile “${S.profile?.name || ''}”.`),
     h('a', { class: 'btn primary', href: '#/import' }, 'Import my Facebook files'));
 }
 function chips(options, current, onPick) {
@@ -285,6 +296,7 @@ async function renderThread(id, focusOrd) {
     h('button', { class: 'iconbtn', title: 'Export conversation', 'aria-label': 'Export conversation', onclick: () => exportMenu(t) }, '⤓'));
   const box = h('div', { class: 'msgs' });
   const info = h('div', { class: 'card small mut' },
+    S.profiles.length > 1 ? h('div', null, 'Profile: ', (S.profile.icon || '👤') + ' ' + S.profile.name) : null,
     h('div', null, 'Participants: ', t.participants.join(', ') || '—'),
     t.isStillParticipant === false ? h('div', null, 'You had left this conversation.') : null,
     t.missingMedia ? h('div', { style: 'color:var(--warn)' }, `⚠️ ${t.missingMedia} attachment(s) are referenced in the messages but were not included in the export.`) : null,
@@ -545,9 +557,9 @@ async function renderFriends() {
   filt.addEventListener('input', () => { frF.q = filt.value; shown = 200; draw(); });
   draw();
 }
-function friendItem(r) {
+function friendItem(r, L, badge) {
   const m = r._match;
-  return h('li', { class: 'item' }, avatar(r.name, r.image),
+  return h('li', { class: 'item' }, avatar(r.name, r.image, false, L),
     h('div', { class: 'grow' },
       h('div', { class: 't1' }, r.name || '(no name)'),
       linkEl(r.url) || h('div', { class: 't2' }, 'No profile link available'),
@@ -557,7 +569,7 @@ function friendItem(r) {
         m && r.source === 'page' ? h('span', { class: 'badge ok' }, '✓ In export' + (m.ts ? ' · friends since ' + fmtDate(m.ts) : '')) : null,
         r._ambig ? h('span', { class: 'badge warn' }, `Name shared (${r._ambig.page} on page / ${r._ambig.exp} in export) – not merged`) : null,
         r.otherNames && r.otherNames.length ? h('span', { class: 'badge' }, 'also shown as ' + r.otherNames.join(', ')) : null),
-      r.detail ? h('div', { class: 'mut small' }, r.detail) : null));
+      r.detail ? h('div', { class: 'mut small' }, r.detail) : null, badge || null));
 }
 
 /* ---------- Groups ---------- */
@@ -640,42 +652,65 @@ async function renderPages() {
 
 /* ---------- Search ---------- */
 async function ensureSearchIdx() { if (S.searchIdx) return; const rows = await LCA.getAll('search'); S.searchIdx = new Map(rows.map(r => [r.threadId, r])); }
+/* Everything search needs from one profile. The current profile uses the loaded state; other profiles are read from their own database. */
+async function searchCtx(p) {
+  if (p.id === S.profile.id) { await ensureSearchIdx(); return { p, L: LCA, threads: S.threads, threadMap: S.threadMap, owner: S.owner, idx: S.searchIdx, cur: true }; }
+  if (S.xcache.has(p.id)) return S.xcache.get(p.id);
+  const L = LCA.at(p.db);
+  const threads = await L.getAll('threads'); const rows = await L.getAll('search');
+  const c = { p, L, threads, threadMap: new Map(threads.map(t => [t.id, t])), owner: await L.getMeta('owner', null), idx: new Map(rows.map(r => [r.threadId, r])), cur: false };
+  S.xcache.set(p.id, c); return c;
+}
+const profBadge = (p) => h('span', { class: 'badge prof', title: 'Profile' }, (p.icon || '👤') + ' ' + p.name);
 async function renderSearch(qfull) {
   const qi = qfull.lastIndexOf('?t='); const q = (qi >= 0 ? qfull.slice(0, qi) : qfull).trim(); const onlyThread = qi >= 0 ? decodeURIComponent(qfull.slice(qi + 3)) : null;
   $('#q').value = q;
   view.append(h('h2', null, `Search: “${q}”`));
+  const multi = S.profiles.length > 1 && !onlyThread;
+  const all = multi && S.searchScope === 'all';
+  if (multi) view.append(h('div', { class: 'scope' }, chips([['this', `${S.profile.icon || '👤'} This profile only`], ['all', `All profiles (${S.profiles.length})`]], all ? 'all' : 'this', async (v) => { S.searchScope = v; await PR.setSetting('searchScope', v); render(); })));
   if (!q) return;
   const ql = q.toLowerCase(), qn = normName(q);
-  await ensureSearchIdx();
   const t0 = performance.now();
+  const ctxs = [];
+  for (const p of (all ? S.profiles : [S.profile])) { try { ctxs.push(await searchCtx(p)); } catch (e) { view.append(h('div', { class: 'note' }, `Could not search the profile “${p.name}”: ${e.message}`)); } }
   const hits = []; let total = 0, scanned = 0;
-  for (const [tid, s] of S.searchIdx) {
+  for (const c of ctxs) for (const [tid, s] of c.idx) {
     if (onlyThread && tid !== onlyThread) continue;
     scanned += s.texts.length;
-    for (let i = 0; i < s.texts.length; i++) if (s.texts[i].includes(ql)) { total++; hits.push([tid, s.ords[i]]); }
+    for (let i = 0; i < s.texts.length; i++) if (s.texts[i].includes(ql)) { total++; hits.push([c, tid, s.ords[i]]); }
   }
-  const convs = onlyThread ? [] : S.threads.filter(t => normName(t.title + ' ' + t.participants.join(' ')).includes(qn)).slice(0, 50);
-  const [fr, gr, pg] = onlyThread ? [[], [], []] : await Promise.all(['friends', 'groups', 'pages'].map(s => LCA.getAll(s)));
+  // links into another profile switch to it first
+  const href = (c, path) => c.cur ? '#/' + path : '#/go/' + encodeURIComponent(c.p.id) + '/' + path;
+  const pb = (c) => all ? profBadge(c.p) : null;
   const fm = (arr) => arr.filter(r => normName((r.name || '') + ' ' + (r.username || '') + ' ' + (r.fbId || '') + ' ' + (r.title || '')).includes(qn));
   if (onlyThread) view.append(h('div', { class: 'mut small' }, 'In conversation: ', h('a', { href: '#/thread/' + encodeURIComponent(onlyThread) }, S.threadMap.get(onlyThread)?.title || '')));
-  if (convs.length) view.append(h('h3', null, `Conversations (${convs.length})`), h('ul', { class: 'list card', style: 'padding:0 8px' }, convs.map(t => h('li', null, h('a', { class: 'item', href: '#/thread/' + encodeURIComponent(t.id) }, avatar(t.title), h('div', { class: 'grow' }, h('div', { class: 't1' }, t.title), h('div', { class: 't2' }, `${fmtN(t.msgCount)} messages · ${catLabel(t.category)}`)))))));
+  const convs = onlyThread ? [] : ctxs.flatMap(c => c.threads.filter(t => normName(t.title + ' ' + t.participants.join(' ')).includes(qn)).map(t => [c, t])).slice(0, 80);
+  if (convs.length) view.append(h('h3', null, `Conversations (${convs.length})`), h('ul', { class: 'list card', style: 'padding:0 8px' }, convs.map(([c, t]) => h('li', null, h('a', { class: 'item', href: href(c, 'thread/' + encodeURIComponent(t.id)) }, avatar(t.title), h('div', { class: 'grow' }, h('div', { class: 't1' }, t.title), h('div', { class: 't2' }, `${fmtN(t.msgCount)} messages · ${catLabel(t.category)}`), pb(c)))))));
   const msgBox = h('ul', { class: 'list card', style: 'padding:0 8px' });
   const LIMIT = 300;
   view.append(h('h3', null, `Messages (${fmtN(total)}${total > LIMIT ? ', showing ' + LIMIT + ' newest' : ''})`), msgBox);
-  hits.sort((a, b) => ((S.threadMap.get(b[0])?.lastTs || 0) - (S.threadMap.get(a[0])?.lastTs || 0)) || b[1] - a[1]);
-  const msgs = (await Promise.all(hits.slice(0, 1500).map(([tid, ord]) => LCA.get('messages', tid + '#' + String(ord).padStart(7, '0'))))).filter(Boolean).sort((a, b) => (b.ts || 0) - (a.ts || 0)).slice(0, LIMIT);
-  for (const m of msgs) {
-    const t = S.threadMap.get(m.threadId);
+  hits.sort((a, b) => ((b[0].threadMap.get(b[1])?.lastTs || 0) - (a[0].threadMap.get(a[1])?.lastTs || 0)) || b[2] - a[2]);
+  const msgs = (await Promise.all(hits.slice(0, 1500).map(async ([c, tid, ord]) => { const m = await c.L.get('messages', tid + '#' + String(ord).padStart(7, '0')); return m ? [c, m] : null; }))).filter(Boolean).sort((a, b) => (b[1].ts || 0) - (a[1].ts || 0)).slice(0, LIMIT);
+  for (const [c, m] of msgs) {
+    const t = c.threadMap.get(m.threadId);
     const txt = [m.text, m.share?.text, m.share?.link, ...(m.att || []).map(a => a.name)].filter(Boolean).join(' ');
     const i = Math.max(0, txt.toLowerCase().indexOf(ql)); const st = Math.max(0, i - 50);
     const snip = (st > 0 ? '…' : '') + esc(txt.slice(st, i)) + '<mark class="hl">' + esc(txt.slice(i, i + q.length)) + '</mark>' + esc(txt.slice(i + q.length, i + q.length + 90)) + (i + q.length + 90 < txt.length ? '…' : '');
-    msgBox.append(h('li', null, h('a', { class: 'item', href: '#/thread/' + encodeURIComponent(m.threadId) + '/' + m.ord }, h('div', { class: 'grow' },
-      h('div', { class: 't1' }, (t?.title || '') + ' · ' + (isMe(m.sender) ? 'You' : (m.sender || ''))), h('div', { class: 'snip', html: snip })), h('div', { class: 'when' }, fmtDate(m.ts)))));
+    const me = !!c.owner && m.sender === c.owner;
+    msgBox.append(h('li', null, h('a', { class: 'item', href: href(c, 'thread/' + encodeURIComponent(m.threadId) + '/' + m.ord) }, h('div', { class: 'grow' },
+      h('div', { class: 't1' }, (t?.title || '') + ' · ' + (me ? 'You' : (m.sender || ''))), h('div', { class: 'snip', html: snip }), pb(c)), h('div', { class: 'when' }, fmtDate(m.ts)))));
   }
-  if (!msgs.length) msgBox.append(h('li', { class: 'empty' }, S.searchIdx.size ? 'No messages contain that text.' : 'No conversations imported yet.'));
-  const sect = (label, arr, kind) => { const f = fm(arr); if (!f.length) return; view.append(h('h3', null, `${label} (${f.length})`), h('ul', { class: 'list card', style: 'padding:0 8px' }, f.slice(0, 100).map(r => kind === 'friends' ? friendItem(r) : h('li', { class: 'item' }, avatar(r.name, r.image, kind === 'groups'), h('div', { class: 'grow' }, h('div', { class: 't1' }, r.name || r.title), linkEl(r.url) || h('div', { class: 't2' }, r.source === 'export' ? 'From export' : '')))))); };
-  sect('Friends', fr, 'friends'); sect('Groups', gr, 'groups'); sect('Pages', pg, 'pages');
-  view.append(h('div', { class: 'mut small', style: 'margin-top:10px' }, `Searched ${fmtN(scanned)} messages in ${Math.round(performance.now() - t0)} ms.`));
+  if (!msgs.length) msgBox.append(h('li', { class: 'empty' }, ctxs.some(c => c.idx.size) ? 'No messages contain that text.' : 'No conversations imported yet.'));
+  if (!onlyThread) {
+    const lists = await Promise.all(ctxs.map(async c => [c, ...(await Promise.all(['friends', 'groups', 'pages'].map(s => c.L.getAll(s))))]));
+    const sect = (label, k, kind) => {
+      const f = lists.flatMap(row => fm(row[k]).map(r => [row[0], r])); if (!f.length) return;
+      view.append(h('h3', null, `${label} (${f.length})`), h('ul', { class: 'list card', style: 'padding:0 8px' }, f.slice(0, 150).map(([c, r]) => kind === 'friends' ? friendItem(r, c.L, pb(c)) : h('li', { class: 'item' }, avatar(r.name, r.image, kind === 'groups', c.L), h('div', { class: 'grow' }, h('div', { class: 't1' }, r.name || r.title), linkEl(r.url) || h('div', { class: 't2' }, r.source === 'export' ? 'From export' : ''), pb(c))))));
+    };
+    sect('Friends', 1, 'friends'); sect('Groups', 2, 'groups'); sect('Pages', 3, 'pages');
+  }
+  view.append(h('div', { class: 'mut small', style: 'margin-top:10px' }, `Searched ${fmtN(scanned)} messages${all ? ` in ${ctxs.length} profiles` : ` in “${S.profile.name}”`} in ${Math.round(performance.now() - t0)} ms.`));
 }
 
 /* ---------- Import & status ---------- */
@@ -684,19 +719,19 @@ async function renderImport() {
   const fileInput = (accept, multiple, dir) => { const i = h('input', { type: 'file', accept: accept || null, multiple, hidden: true }); if (dir) i.setAttribute('webkitdirectory', ''); i.addEventListener('change', () => { importFiles(i.files); }); return i; };
   const any = fileInput('', true), zipI = fileInput('.zip,application/zip', true), htmlI = fileInput('.html,.htm,text/html', true), dirI = fileInput('', true, true);
   const restI = h('input', { type: 'file', accept: '.zip,application/zip', hidden: true });
-  restI.addEventListener('change', async () => {
-    if (!restI.files[0]) return; if (!confirm('Restore this backup? Everything currently stored in the app will be replaced.')) return;
-    S.busy = true; $('#prog').hidden = false;
-    try { await runWorker({ type: 'restore', file: restI.files[0] }); await loadState(true); toast('Backup restored'); render(); } catch (e) { alert('Restore failed: ' + e.message); } finally { S.busy = false; }
-  });
+  restI.addEventListener('change', () => { const f = restI.files[0]; restI.value = ''; if (f) restoreFlow(f); });
   const ios = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
   const standalone = navigator.standalone || matchMedia('(display-mode: standalone)').matches;
+  const P = S.profile, stats = await profileStats(LCA);
   view.append(h('h2', null, 'Import & status'), installCard() || '',
+    (await nameSuggestionCard()) || "",
     h('div', { class: 'card' },
-      h('p', { style: 'margin-top:0' }, '🔒 Your files are read and stored only on this device. Nothing is uploaded, and no Facebook login is needed.'),
+      h('div', { class: 'into' }, h('span', { class: 'pic' }, P.icon || '👤'), h('div', { class: 'grow' }, h('div', { class: 'small mut' }, 'Everything you import now goes into the profile'), h('b', null, P.name)),
+        h('button', { class: 'btn', disabled: S.busy, onclick: () => openProfileSheet() }, S.profiles.length > 1 ? 'Switch' : 'Add profile')),
+      h('p', null, '🔒 Your files are read and stored only on this device. Nothing is uploaded, and no Facebook login is needed.'),
       ios && !standalone ? h('div', { class: 'note' }, '📱 On iPhone: first add this app to your Home Screen (Share ⬆️ → “Add to Home Screen”), open it from there, and import inside the app. Safari and the Home Screen app keep separate storage.') : null,
       h('button', { class: 'btn big primary', onclick: () => any.click() }, '📂 Choose files to import'),
-      h('div', { class: 'mut small' }, 'Pick “Liz coobys meta export.zip” and/or friends.html, Groups.html and pages.html — one at a time or several together. No need to unzip or rename anything. Re-importing a file replaces what came from it before.'),
+      h('div', { class: 'mut small' }, 'Pick the profile’s Facebook export (.zip) and/or its saved friends.html, Groups.html and pages.html — one at a time or several together. No need to unzip or rename anything. Re-importing a file replaces what came from it before (in this profile only). Each Facebook profile has its own export: switch profile at the top before importing the next one.'),
       h('details', null, h('summary', null, 'More import options'),
         h('button', { class: 'btn big', onclick: () => zipI.click() }, '🗜️ Facebook export (.zip, several parts allowed)'),
         h('button', { class: 'btn big', onclick: () => htmlI.click() }, '🌐 Saved Facebook pages (friends / Groups / pages .html)'),
@@ -705,16 +740,19 @@ async function renderImport() {
       any, zipI, htmlI, dirI, restI,
       h('div', { id: 'prog', hidden: !S.busy, style: 'margin-top:10px' }, h('div', { id: 'progPhase', class: 'small' }, 'Working…'), h('progress', { id: 'progBar', max: 1, value: 0 }), h('div', { id: 'progNote', class: 'mut small' }))),
     await reportView(),
-    h('div', { class: 'card' }, h('h3', { style: 'margin-top:0' }, '💾 Storage on this device'),
-      h('div', null, `Used: ${fmtBytes(st.usage)}${st.quota ? ' · available to this app: ' + fmtBytes(st.quota) : ''}.`),
+    h('div', { class: 'card' }, h('h3', { style: 'margin-top:0' }, '💾 Storage'),
+      h('div', null, h('b', null, `${P.icon || '👤'} ${P.name}: `), statsLine(stats)),
+      h('div', null, `Whole app on this device (all ${S.profiles.length} profile${S.profiles.length === 1 ? '' : 's'}): ${fmtBytes(st.usage)} used${st.quota ? ' · available to this app: ' + fmtBytes(st.quota) : ''}.`),
       h('div', null, st.persisted ? '✅ Storage is persistent – the browser will not clear it on its own.' : '⚠️ Storage is not marked persistent yet. ', !st.persisted ? h('button', { class: 'btn', onclick: async () => { const ok = await askPersist(); toast(ok ? 'Storage is now persistent' : 'The browser declined – installing the app to the home screen helps'); render(); } }, 'Make persistent') : null),
       st.quota && st.usage / st.quota > 0.85 ? h('div', { class: 'note' }, '⚠️ Storage is almost full. Make a backup and free up space on the device.') : null),
     h('div', { class: 'card' }, h('h3', { style: 'margin-top:0' }, '🧳 Backup & move to another device'),
-      h('p', { class: 'small mut', style: 'margin-top:0' }, 'Creates one .zip file with every conversation, photo, video, friend, group and page in this app. Keep it somewhere safe (computer, USB stick, your own cloud). On another device, open this app and tap “Restore backup” (or simply import the backup file).'),
-      h('div', { class: 'row' }, h('button', { class: 'btn primary', onclick: doBackup }, '⤓ Download full backup'), h('button', { class: 'btn', onclick: () => restI.click() }, '⤒ Restore backup'))),
-    await ownerCard(),
+      h('p', { class: 'small mut', style: 'margin-top:0' }, 'Creates one .zip file with every conversation, photo, video, friend, group and page – either of this profile only, or of all profiles together. Keep it somewhere safe (computer, USB stick, your own cloud). On another device, open this app and tap “Restore backup” (or simply import the backup file). Backups made with the earlier one-profile version can be restored too.'),
+      h('div', { class: 'row' }, h('button', { class: 'btn primary', onclick: () => doBackup(false) }, `⤓ Back up “${P.name}”`),
+        S.profiles.length > 1 ? h('button', { class: 'btn primary', onclick: () => doBackup(true) }, `⤓ Back up all ${S.profiles.length} profiles`) : null,
+        h('button', { class: 'btn', onclick: () => restI.click() }, '⤒ Restore backup'))),
+    (await ownerCard()) || "",
     h('div', { class: 'card' }, h('h3', { style: 'margin-top:0' }, 'About'), h('div', { class: 'small mut' }, 'Liz Coobys Archive works offline after the first visit. It shows only what is actually in your imported files; nothing is invented or reconstructed. Profile links open Facebook and will only work while those profiles exist.'),
-      h('button', { class: 'btn danger', style: 'margin-top:8px', onclick: eraseAll }, 'Erase everything from this device')));
+      h('button', { class: 'btn danger', style: 'margin-top:8px', onclick: eraseAll }, `Erase the data of “${P.name}”`), h('div', { class: 'small mut' }, 'Only this profile is erased. To remove a profile completely, use the profile menu at the top.')));
 }
 async function ownerCard() {
   const names = new Map(); for (const t of S.threads) for (const p of t.participants) names.set(p, (names.get(p) || 0) + 1);
@@ -723,15 +761,22 @@ async function ownerCard() {
   sel.addEventListener('change', async () => { await LCA.setMeta('owner', sel.value || null); S.owner = sel.value || null; toast('Saved'); });
   return h('div', { class: 'card' }, h('h3', { style: 'margin-top:0' }, '🙋 Which name is you?'), h('div', { class: 'small mut' }, 'Your own messages are shown on the right in blue.'), sel);
 }
-async function doBackup() {
-  if (S.busy) return; S.busy = true; $('#prog').hidden = false;
-  try { const r = await runWorker({ type: 'backup' }); const d = new Date().toISOString().slice(0, 10); saveBlob(r.blob, `liz-coobys-archive-backup-${d}.zip`); await LCA.setMeta('lastBackup', Date.now()); setProgress('Backup ready – ' + fmtBytes(r.blob.size), 1, 1); }
-  catch (e) { alert('Backup failed: ' + e.message); } finally { S.busy = false; }
+async function doBackup(all) {
+  if (S.busy) return toast('Please wait – something is still running'); S.busy = true; drawProfileBtn(); $('#prog').hidden = false;
+  const list = (all ? S.profiles : [S.profile]).map(p => ({ id: p.id, name: p.name, icon: p.icon || null, db: p.db }));
+  try {
+    const r = await runWorker({ type: 'backup', profiles: list, all: !!all }); const d = new Date().toISOString().slice(0, 10);
+    saveBlob(r.blob, all ? `liz-coobys-archive-backup-all-profiles-${d}.zip` : `liz-coobys-archive-backup-${fileSafe(list[0].name)}-${d}.zip`);
+    for (const p of list) await LCA.at(p.db).setMeta('lastBackup', Date.now());
+    setProgress('Backup ready – ' + fmtBytes(r.blob.size) + (all ? ` (${list.length} profiles)` : ` (${list[0].name})`), 1, 1);
+  }
+  catch (e) { alert('Backup failed: ' + e.message); } finally { S.busy = false; drawProfileBtn(); }
 }
+const fileSafe = (n) => (n || 'profile').replace(/[\\/:*?"<>|\s]+/g, '-').slice(0, 40);
 async function eraseAll() {
-  if (!confirm('Erase ALL archived data from this device? Make a backup first if you want to keep it.')) return;
-  if (!confirm('Really erase everything?')) return;
-  await LCA.clear(LCA.STORES); avCache.clear(); await loadState(true); toast('Erased'); render();
+  if (!confirm(`Erase all archived data of the profile “${S.profile.name}” from this device? Other profiles are not touched. Make a backup first if you want to keep it.`)) return;
+  if (!confirm(`Really erase everything in “${S.profile.name}”?`)) return;
+  await LCA.clear(LCA.STORES); await LCA.setMeta('profileName', S.profile.name); avCache.clear(); S.xcache.clear(); await loadState(true); toast('Erased'); render();
 }
 async function reportView() {
   const r = S.report; const c = h('div', { class: 'card', id: 'report' }, h('h3', { style: 'margin-top:0' }, '📋 What has been recovered'));
@@ -799,9 +844,271 @@ function installCard() {
   if (installEvt) return h('div', { class: 'card' }, h('button', { class: 'btn big primary', onclick: async () => { installEvt.prompt(); await installEvt.userChoice.catch(() => null); installEvt = null; render(); } }, '📲 Install Liz Coobys Archive on this device'));
   return h('div', { class: 'card small mut' }, '📲 Install: on iPhone tap Share ⬆️ → “Add to Home Screen”. On Android open the Chrome menu ⋮ → “Install app” / “Add to Home screen”.');
 }
+/* ---------- profiles ----------
+   The list of profiles lives in its own small database. Each profile's data lives in a separate database,
+   so nothing can mix. The first version's database becomes the profile "Liz Coobys", untouched. */
+const PR = (() => {
+  let dbp = null;
+  const open = () => dbp || (dbp = new Promise((res, rej) => {
+    const r = indexedDB.open('lizcoobys-profiles', 1);
+    r.onupgradeneeded = () => { const d = r.result; d.createObjectStore('profiles', { keyPath: 'id' }); d.createObjectStore('settings', { keyPath: 'key' }); };
+    r.onsuccess = () => res(r.result); r.onerror = () => { dbp = null; rej(r.error); };
+  }));
+  const tx = async (store, mode, fn) => { const d = await open(); return new Promise((res, rej) => { const t = d.transaction(store, mode); const out = fn(t.objectStore(store)); t.oncomplete = () => res(out && 'result' in out ? out.result : undefined); t.onerror = () => rej(t.error); t.onabort = () => rej(t.error || new Error('aborted')); }); };
+  return {
+    all: async () => ((await tx('profiles', 'readonly', s => s.getAll())) || []).sort((a, b) => (a.order ?? 0) - (b.order ?? 0) || a.createdAt - b.createdAt),
+    put: (p) => tx('profiles', 'readwrite', s => { s.put(p); }),
+    del: (id) => tx('profiles', 'readwrite', s => { s.delete(id); }),
+    getSetting: async (k, def) => { const r = await tx('settings', 'readonly', s => s.get(k)); return r ? r.value : def; },
+    setSetting: (k, v) => tx('settings', 'readwrite', s => { s.put({ key: k, value: v }); })
+  };
+})();
+const ICONS = ['👤', '🐱', '🐶', '🐾', '🐴', '🌸', '⭐', '💜', '🏡', '💼'];
+const newId = () => 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+async function initProfiles() {
+  let list = await PR.all();
+  if (!list.length) {
+    // first start of this version (or a fresh install): keep the existing archive as the default profile
+    const L = LCA.at(LCA.LEGACY_DB);
+    const had = (await L.count('threads')) + (await L.count('friends')) + (await L.count('groups')) + (await L.count('pages')) + (await L.count('media'));
+    const d = { id: 'p-default', name: (await L.getMeta('profileName', null)) || 'Liz Coobys', icon: (await L.getMeta('profileIcon', null)) || '🐱', db: LCA.LEGACY_DB, createdAt: Date.now(), order: 0 };
+    if (had) d.migratedFromV1 = Date.now();
+    await PR.put(d); await L.setMeta('profileName', d.name); await L.setMeta('profileIcon', d.icon);
+    // if the profile list was lost but other profile databases are still there, list them again instead of hiding them
+    if (indexedDB.databases) {
+      try {
+        let order = 1;
+        for (const x of await indexedDB.databases()) if (x.name && x.name.startsWith(LCA.PROFILE_DB_PREFIX)) {
+          const R = LCA.at(x.name);
+          await PR.put({ id: x.name.slice(LCA.PROFILE_DB_PREFIX.length), name: (await R.getMeta('profileName', null)) || 'Recovered profile', icon: (await R.getMeta('profileIcon', null)) || '👤', db: x.name, createdAt: Date.now(), order: order++ });
+        }
+      } catch (e) { console.warn(e); }
+    }
+    list = await PR.all();
+  }
+  const cur = await PR.getSetting('current', null);
+  S.searchScope = await PR.getSetting('searchScope', 'this');
+  const p = list.find(x => x.id === cur) || list[0];
+  LCA.use(p.db); S.profiles = list; S.profile = p;
+}
+function resetProfileView() {
+  revokeAll(); for (const u of avCache.values()) if (u.startsWith('blob:')) URL.revokeObjectURL(u); avCache.clear();
+  S.threads = null; S.threadMap = null; S.searchIdx = null; S.report = null; S.owner = null;
+  msgrFilter = { cat: 'all', q: '' }; galF = { thread: '', kind: 'visual', from: '', to: '' }; frF = { tab: 'all', q: '' }; grF = { tab: 'all', q: '' }; pgF = { tab: 'page', q: '' };
+}
+async function switchProfile(id, hashAfter, replace) {
+  if (S.busy) { toast('Please wait until the import / backup has finished'); return false; }
+  const p = S.profiles.find(x => x.id === id); if (!p) return false;
+  if (p.id !== S.profile.id) {
+    S.profile = p; LCA.use(p.db); await PR.setSetting('current', p.id); resetProfileView(); await loadState(true); drawProfileBtn();
+    toast(`${p.icon || '👤'} ${p.name}`, 1500);
+  }
+  let target = hashAfter;
+  if (!target) { const tab = (location.hash || '#/messenger').slice(2).split('/')[0]; target = ['thread', 'search', 'go'].includes(tab) ? '#/messenger' : (location.hash || '#/messenger'); }
+  if (location.hash === target) render(); else if (replace) location.replace(target); else location.hash = target;
+  return true;
+}
+function drawProfileBtn() {
+  const b = $('#profBtn'); if (!b || !S.profile) return;
+  b.innerHTML = ''; b.append(h('span', { class: 'pic' }, S.profile.icon || '👤'), h('span', { class: 'pname' }, S.profile.name), h('span', { class: 'caret' }, '▾'));
+  b.title = 'Profile: ' + S.profile.name + ' – tap to switch'; b.classList.toggle('busy', !!S.busy);
+  document.title = S.profile.name + ' · Liz Coobys Archive';
+}
+async function profileStats(L) {
+  const [threads, messages, friends, groups, pages] = await Promise.all(['threads', 'messages', 'friends', 'groups', 'pages'].map(s => L.count(s)));
+  let media = 0, mediaBytes = 0; const d = await L.openDB();
+  await new Promise((res, rej) => { const c = d.transaction('media').objectStore('media').openCursor(); c.onsuccess = () => { const cur = c.result; if (!cur) return res(); media++; mediaBytes += cur.value.size || 0; cur.continue(); }; c.onerror = () => rej(c.error); });
+  return { threads, messages, friends, groups, pages, media, mediaBytes, lastBackup: await L.getMeta('lastBackup', null), fbName: await L.getMeta('ownerFromProfile', null) };
+}
+const statsLine = (st) => !st.threads && !st.friends && !st.groups && !st.pages && !st.media ? 'nothing imported yet' :
+  `${fmtN(st.threads)} conversations · ${fmtN(st.messages)} messages · ${fmtN(st.media)} media files (${fmtBytes(st.mediaBytes)}) · ${fmtN(st.friends)} people · ${fmtN(st.groups)} groups · ${fmtN(st.pages)} pages`;
+/* bottom sheet */
+const fill = (box, ...kids) => box.append(...kids.flat(Infinity).filter(k => k != null && k !== false));
+function sheet(build, onClose) {
+  const bg = h('div', { class: 'sheet-bg' }); const box = h('div', { class: 'sheet', role: 'dialog', 'aria-modal': 'true' });
+  const close = () => { bg.remove(); document.removeEventListener('keydown', esc_); if (onClose) onClose(); };
+  const esc_ = (e) => { if (e.key === 'Escape') close(); };
+  bg.addEventListener('click', (e) => { if (e.target === bg) close(); }); document.addEventListener('keydown', esc_);
+  bg.append(box); document.body.append(bg); build(box, close); return close;
+}
+function choose(title, text, options) {
+  return new Promise((resolve) => {
+    sheet((box, close) => {
+      fill(box, h('h3', { style: 'margin-top:0' }, title), text ? h('p', { class: 'small', style: 'white-space:pre-line' }, text) : null,
+        options.map(([v, label, cls]) => h('button', { class: 'btn big ' + (cls || ''), onclick: () => { resolve(v); close(); } }, label)),
+        h('button', { class: 'btn big', onclick: () => close() }, 'Cancel'));
+    }, () => resolve(null));
+  });
+}
+async function openProfileSheet() {
+  if (S.busy) return toast('Please wait until the import / backup has finished');
+  const stats = new Map(await Promise.all(S.profiles.map(async p => [p.id, await profileStats(LCA.at(p.db)).catch(() => null)])));
+  sheet((box, close) => {
+    fill(box, h('div', { class: 'row', style: 'justify-content:space-between' }, h('h3', { style: 'margin:0' }, 'Profiles'), h('button', { class: 'iconbtn', 'aria-label': 'Close', onclick: close }, '✕')),
+      h('p', { class: 'small mut', style: 'margin:4px 0 8px' }, 'Each profile keeps its own conversations, photos, friends, groups, pages, report and backup. Imports always go into the profile that is selected.'),
+      h('ul', { class: 'list profs' }, S.profiles.map(p => {
+        const st = stats.get(p.id), on = p.id === S.profile.id;
+        return h('li', { class: 'prow' + (on ? ' on' : '') },
+          h('button', { class: 'pick', 'data-profile': p.id, onclick: async () => { close(); await switchProfile(p.id); } },
+            h('span', { class: 'pic big' }, p.icon || '👤'),
+            h('span', { class: 'grow' }, h('span', { class: 't1' }, p.name, on ? h('span', { class: 'badge ok', style: 'margin-left:6px' }, '✓ selected') : null),
+              h('span', { class: 't2' }, st ? statsLine(st) : 'could not be read'),
+              st && st.fbName && normName(st.fbName) !== normName(p.name) ? h('span', { class: 't2' }, `Facebook name in export: ${st.fbName}`) : null)),
+          h('button', { class: 'iconbtn', 'aria-label': 'Edit profile ' + p.name, title: 'Rename / delete', onclick: () => { close(); profileForm(p); } }, '✏️'));
+      })),
+      h('button', { class: 'btn big primary', onclick: () => { close(); profileForm(null); } }, '＋ Add a profile'));
+  });
+}
+function profileForm(p) {
+  const editing = !!p; let icon = p ? (p.icon || '👤') : '👤';
+  sheet((box, close) => {
+    const name = h('input', { type: 'text', value: p ? p.name : '', placeholder: 'e.g. Lizette (private) or the dog’s name', maxlength: 60, style: inputStyle, 'aria-label': 'Profile name' });
+    const icons = h('div', { class: 'chips', style: 'flex-wrap:wrap' });
+    const drawIcons = () => { icons.innerHTML = ''; ICONS.forEach(ic => icons.append(h('button', { class: 'chip' + (ic === icon ? ' on' : ''), 'aria-label': 'Icon ' + ic, onclick: () => { icon = ic; drawIcons(); } }, ic))); };
+    drawIcons();
+    const save = async () => {
+      const n = name.value.trim(); if (!n) { name.focus(); return toast('Please type a name'); }
+      if (S.profiles.some(x => x.id !== p?.id && normName(x.name) === normName(n))) return toast('Another profile already has that name');
+      if (editing) { await renameProfile(p, n, icon); close(); toast('Saved'); render(); }
+      else { const np = await createProfile(n, icon); close(); await switchProfile(np.id, '#/import'); toast(`Profile “${n}” created – now import its Facebook files`, 3500); }
+    };
+    name.addEventListener('keydown', (e) => { if (e.key === 'Enter') save(); });
+    fill(box, h('h3', { style: 'margin-top:0' }, editing ? 'Edit profile' : 'New profile'),
+      h('label', { class: 'small mut' }, 'Name'), name, h('div', { class: 'small mut' }, 'Icon'), icons,
+      !editing ? h('p', { class: 'small mut' }, 'After creating it you can import that profile’s Facebook export. If the export contains the profile’s name, the app offers it as the profile name.') : null,
+      h('button', { class: 'btn big primary', onclick: save }, editing ? 'Save' : 'Create profile'),
+      editing ? h('button', { class: 'btn big danger', disabled: S.profiles.length < 2, onclick: () => { close(); deleteProfile(p); } }, S.profiles.length < 2 ? 'Delete profile (not possible – it is the only one)' : `🗑 Delete profile “${p.name}”…`) : null,
+      h('button', { class: 'btn big', onclick: close }, 'Cancel'));
+    setTimeout(() => name.focus(), 50);
+  });
+}
+async function createProfile(name, icon, id) {
+  id = id || newId();
+  const p = { id, name, icon: icon || '👤', db: LCA.PROFILE_DB_PREFIX + id, createdAt: Date.now(), order: Math.max(0, ...S.profiles.map(x => x.order ?? 0)) + 1 };
+  const L = LCA.at(p.db); await L.setMeta('profileName', name); await L.setMeta('profileIcon', p.icon);
+  await PR.put(p); S.profiles = await PR.all(); return p;
+}
+async function renameProfile(p, name, icon) {
+  const np = Object.assign({}, p, { name, icon: icon || p.icon }); await PR.put(np);
+  const L = LCA.at(p.db); await L.setMeta('profileName', name); await L.setMeta('profileIcon', np.icon);
+  S.profiles = await PR.all(); if (S.profile.id === p.id) S.profile = S.profiles.find(x => x.id === p.id); S.xcache.clear(); drawProfileBtn();
+}
+function stopWorker() { if (worker) { worker.terminate(); worker = null; } }
+async function deleteProfile(p) {
+  if (S.busy) return toast('Please wait until the import / backup has finished');
+  if (S.profiles.length < 2) return toast('The last profile cannot be deleted');
+  const st = await profileStats(LCA.at(p.db)).catch(() => null);
+  const typed = prompt(`Delete the profile “${p.name}” and everything imported into it (${st ? statsLine(st) : 'unknown contents'})?\n\nOther profiles are not touched. This cannot be undone – make a backup first if you want to keep it.\n\nType the profile name to confirm:`);
+  if (typed == null) return;
+  if (normName(typed) !== normName(p.name)) return alert('The name did not match – nothing was deleted.');
+  if (p.id === S.profile.id) { const other = S.profiles.find(x => x.id !== p.id); S.profile = other; LCA.use(other.db); await PR.setSetting('current', other.id); resetProfileView(); }
+  stopWorker(); S.xcache.clear();
+  await PR.del(p.id); S.profiles = await PR.all();
+  try { await LCA.deleteDatabase(p.db); } catch (e) { console.warn(e); }
+  await loadState(true); drawProfileBtn(); toast(`Profile “${p.name}” deleted`);
+  location.hash = '#/messenger'; render();
+}
+/* Before an export is imported: does its own profile name fit the selected profile? */
+async function confirmProfileName(found) {
+  const P = S.profile, n = normName(found);
+  const here = await LCA.at(P.db).getMeta('ownerFromProfile', null);
+  if (here && normName(here) !== n) return confirm(`This export belongs to the Facebook profile “${found}”, but the profile “${P.name}” in this app already contains an export of “${here}”.\n\nImport it into “${P.name}” anyway? Press Cancel to stop – nothing has been imported yet.`);
+  for (const o of S.profiles) {
+    if (o.id === P.id) continue;
+    const other = await LCA.at(o.db).getMeta('ownerFromProfile', null).catch(() => null);
+    if ((other && normName(other) === n) || (!here && normName(o.name) === n && normName(P.name) !== n)) return confirm(`This export belongs to the Facebook profile “${found}”, which looks like your other profile “${o.name}” in this app.\n\nImport it into “${P.name}” anyway? Press Cancel to stop – nothing has been imported yet (then switch profile at the top).`);
+  }
+  return true;
+}
+async function nameSuggestionCard() {
+  const fb = await LCA.getMeta('ownerFromProfile', null); if (!fb || normName(fb) === normName(S.profile.name)) return null;
+  if ((await LCA.getMeta('nameSuggestionDismissed', null)) === fb) return null;
+  const c = h('div', { class: 'card suggest' }, h('div', null, `💡 The imported export says this Facebook profile is called “${fb}”.`),
+    h('div', { class: 'row', style: 'margin-top:8px' },
+      h('button', { class: 'btn primary', onclick: async () => { if (S.profiles.some(x => x.id !== S.profile.id && normName(x.name) === normName(fb))) return toast('Another profile already has that name'); await renameProfile(S.profile, fb, S.profile.icon); toast('Profile renamed'); render(); } }, `Rename “${S.profile.name}” to “${fb}”`),
+      h('button', { class: 'btn', onclick: async () => { await LCA.setMeta('nameSuggestionDismissed', fb); c.remove(); } }, 'Keep current name')));
+  return c;
+}
+/* ---------- restore ---------- */
+async function restoreFlow(file) {
+  if (S.busy) return toast('Please wait until the import / backup has finished');
+  let info;
+  S.busy = true; drawProfileBtn();
+  try { setProgress('Reading backup', 0, 1); info = await runWorker({ type: 'inspectBackup', file }); }
+  catch (e) { alert('Could not read the backup: ' + e.message); return; }
+  finally { S.busy = false; drawProfileBtn(); }
+  const ps = info.profiles.map((x, i) => Object.assign(x, { label: x.name || x.meta?.profileName || x.meta?.ownerFromProfile || (info.profiles.length > 1 ? `Restored profile ${i + 1}` : 'Restored backup') }));
+  const desc = (x) => `${x.label}: ${fmtN(x.stores?.threads || 0)} conversations, ${fmtN(x.stores?.messages || 0)} messages, ${fmtN(x.stores?.media || 0)} media files`;
+  const when = info.createdAt ? ` from ${fmtDT(info.createdAt)}` : '';
+  let choice;
+  if (ps.length === 1) {
+    choice = await choose('Restore backup', `This backup${when} contains one profile${info.version < 2 ? ' (made with the earlier one-profile version)' : ''} – ${desc(ps[0])}.`,
+      [['new', `＋ Restore as a new profile “${uniqueName(ps[0].label, S.profiles)}”`, 'primary'], ['replace', `Replace the data of “${S.profile.name}” with it`]]);
+  } else {
+    choice = await choose('Restore backup', `This backup${when} contains ${ps.length} profiles:\n` + ps.map(desc).join(' · '),
+      [['new', `＋ Add all ${ps.length} profiles`, 'primary'], ['replaceAll', `Replace all ${S.profiles.length} profile(s) on this device with these ${ps.length}`]]);
+  }
+  if (!choice) return;
+  if (choice === 'replace' && !confirm(`Replace everything in “${S.profile.name}” with the backup? Other profiles are not touched.`)) return;
+  if (choice === 'replaceAll' && !confirm(`Replace ALL profiles on this device with the ${ps.length} profiles from the backup? Profiles that are not in the backup will be deleted.`)) return;
+  S.busy = true; drawProfileBtn(); const prog = $('#prog'); if (prog) prog.hidden = false;
+  const done = [];
+  try {
+    // each profile is restored into a fresh database first; old data is removed only after that succeeded
+    for (let i = 0; i < ps.length; i++) {
+      const x = ps[i], id = newId(), db = LCA.PROFILE_DB_PREFIX + id;
+      setProgress(`Restoring “${x.label}” (${i + 1} of ${ps.length})`, 0, 1);
+      done.push({ x, id, db });
+      await runWorker({ type: 'restore', file, prefix: x.dir || '', db });
+    }
+    stopWorker(); S.xcache.clear();
+    const old = S.profiles.slice();
+    if (choice === 'replace') {
+      const P = S.profile, oldDb = P.db;
+      const np = Object.assign({}, P, { db: done[0].db, restoredAt: Date.now() });
+      const L = LCA.at(np.db); await L.setMeta('profileName', np.name); await L.setMeta('profileIcon', np.icon);
+      await PR.put(np); S.profiles = await PR.all(); S.profile = np; LCA.use(np.db);
+      await LCA.deleteDatabase(oldDb).catch(e => console.warn(e));
+    } else {
+      let first = null;
+      for (const d of done) {
+        const name = uniqueName(d.x.label, choice === 'replaceAll' ? [] : S.profiles);
+        const p = { id: d.id, name, icon: d.x.icon || d.x.meta?.profileIcon || '👤', db: d.db, createdAt: Date.now(), restoredAt: Date.now(), order: Math.max(0, ...S.profiles.map(z => z.order ?? 0)) + 1 };
+        const L = LCA.at(p.db); await L.setMeta('profileName', p.name); await L.setMeta('profileIcon', p.icon);
+        await PR.put(p); S.profiles = await PR.all(); first = first || p;
+      }
+      S.profile = first; LCA.use(first.db);
+      if (choice === 'replaceAll') {
+        for (const o of old) { await PR.del(o.id); await LCA.deleteDatabase(o.db).catch(e => console.warn(e)); }
+        S.profiles = await PR.all();
+      }
+    }
+    await PR.setSetting('current', S.profile.id);
+    resetProfileView(); await loadState(true); drawProfileBtn();
+    setProgress('Backup restored', 1, 1, done.map(d => d.x.label).join(' · ')); toast('Backup restored');
+  } catch (e) {
+    console.error(e); stopWorker();
+    for (const d of done) if (!S.profiles.some(p => p.db === d.db)) await LCA.deleteDatabase(d.db).catch(() => {});
+    alert('Restore failed: ' + e.message + '\n\nNothing on this device was replaced.');
+  } finally { S.busy = false; drawProfileBtn(); }
+  if (location.hash.startsWith('#/import')) { const note = $('#progNote')?.textContent; await render(); setProgress('Backup restored', 1, 1, note); } else location.hash = '#/messenger';
+}
+function uniqueName(n, list) { let out = n, k = 2; while (list.some(p => normName(p.name) === normName(out))) out = `${n} (${k++})`; return out; }
+
+// a page loaded from an older cached index.html has no profile button yet – add it
+if (!$('#profBtn')) { const b = h('button', { type: 'button', id: 'profBtn', class: 'profbtn', 'aria-label': 'Switch profile' }); const br = $('.brand'); if (br) br.after(b); else $('#top').prepend(b); }
+$('#profBtn').addEventListener('click', () => openProfileSheet());
 if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register('sw.js').catch(e => console.warn('SW', e));
 (async () => {
-  try { await LCA.openDB(); } catch (e) { view.append(h('div', { class: 'note' }, 'This browser cannot store the archive (IndexedDB unavailable – private browsing?). ' + e.message)); return; }
+  if (typeof LCA.use !== 'function') {
+    // old shared.js from the browser cache next to the new app.js: reload once to get matching files
+    view.append(h('div', { class: 'note' }, 'Updating the app… ', h('button', { class: 'btn', onclick: () => location.reload() }, 'Reload')));
+    if (!sessionStorage.getItem('lca-reloaded')) { sessionStorage.setItem('lca-reloaded', '1'); setTimeout(() => location.reload(), 1500); }
+    return;
+  }
+  sessionStorage.removeItem('lca-reloaded');
+  try { await initProfiles(); await LCA.openDB(); } catch (e) { view.append(h('div', { class: 'note' }, 'This browser cannot store the archive (IndexedDB unavailable – private browsing?). ' + e.message)); return; }
+  drawProfileBtn();
   await loadState(true);
   if (!location.hash) { location.replace('#/' + (S.threads.length || S.report ? 'messenger' : 'import')); }
   render();

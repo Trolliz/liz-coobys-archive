@@ -14,16 +14,17 @@
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icons/icon-192.png">
 <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
-<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="styles.css?v=5">
 </head>
 <body>
 <header id="top">
   <div class="topline">
-    <a href="#/messenger" class="brand"><img src="icons/icon-192.png" alt=""><span>Liz Coobys Archive</span></a>
+    <a href="#/messenger" class="brand" title="Liz Coobys Archive"><img src="icons/icon-192.png" alt="Liz Coobys Archive"><span>Liz Coobys Archive</span></a>
+    <button type="button" id="profBtn" class="profbtn" aria-label="Switch profile" aria-haspopup="dialog"><span class="pname">…</span></button>
     <a href="#/import" class="statusbtn" id="statusBtn" title="Import &amp; status">⇪ <span>Import &amp; status</span></a>
   </div>
   <form id="searchForm" class="search" role="search">
-    <input id="q" type="search" placeholder="Search messages, people, groups, pages…" autocomplete="off" enterkeyhint="search">
+    <input id="q" type="search" placeholder="Search messages, people, groups, pages…" aria-label="Search" autocomplete="off" enterkeyhint="search">
   </form>
 </header>
 <main id="view" tabindex="-1"></main>
@@ -36,9 +37,9 @@
 </nav>
 <div id="viewer" hidden></div>
 <div id="toast" hidden></div>
-<script src="vendor/zip.min.js"></script>
-<script src="shared.js"></script>
-<script src="parsers.js"></script>
-<script src="app.js"></script>
+<script src="vendor/zip.min.js?v=5"></script>
+<script src="shared.js?v=5"></script>
+<script src="parsers.js?v=5"></script>
+<script src="app.js?v=5"></script>
 </body>
 </html>

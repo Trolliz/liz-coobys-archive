@@ -1,12 +1,15 @@
 /* Liz Coobys Archive - shared helpers (window + worker). Everything stays on this device. */
 'use strict';
 const LCA = (() => {
-  const DB_NAME = 'lizcoobys-archive', DB_VER = 1;
+  /* Every profile has its own IndexedDB database, so profiles can never mix.
+     'lizcoobys-archive' is the database of the first version (single profile) and is kept as the default profile. */
+  const LEGACY_DB = 'lizcoobys-archive', PROFILE_DB_PREFIX = 'lizcoobys-archive-p-', DB_VER = 1;
   const STORES = ['threads', 'messages', 'media', 'files', 'search', 'friends', 'groups', 'pages', 'avatars', 'meta'];
+  function makeDB(DB_NAME) {
   let dbp = null;
   function openDB() {
     if (dbp) return dbp;
-    dbp = new Promise((res, rej) => {
+    const p = dbp = new Promise((res, rej) => {
       const r = indexedDB.open(DB_NAME, DB_VER);
       r.onupgradeneeded = () => {
         const d = r.result;
@@ -23,12 +26,13 @@ const LCA = (() => {
         d.createObjectStore('avatars', { keyPath: 'url' });
         d.createObjectStore('meta', { keyPath: 'key' });
       };
-      r.onsuccess = () => { const d = r.result; d.onversionchange = () => d.close(); res(d); };
-      r.onerror = () => rej(r.error);
-      r.onblocked = () => rej(new Error('Database blocked – close other tabs of the archive.'));
+      r.onsuccess = () => { const d = r.result; d.onversionchange = () => { d.close(); if (dbp === p) dbp = null; }; res(d); };
+      r.onerror = () => { if (dbp === p) dbp = null; rej(r.error); };
+      r.onblocked = () => { if (dbp === p) dbp = null; rej(new Error('Database blocked – close other tabs of the archive.')); };
     });
     return dbp;
   }
+  function close() { const p = dbp; dbp = null; if (p) p.then(d => d.close(), () => {}); }
   const req = (r) => new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
   const done = (t) => new Promise((res, rej) => { t.oncomplete = () => res(); t.onerror = () => rej(t.error); t.onabort = () => rej(t.error || new Error('Transaction aborted (storage full?)')); });
   async function get(store, key) { const d = await openDB(); return req(d.transaction(store).objectStore(store).get(key)); }
@@ -67,6 +71,18 @@ const LCA = (() => {
   }
   async function getMeta(key, def) { const r = await get('meta', key); return r ? r.value : def; }
   async function setMeta(key, value) { return put('meta', { key, value }); }
+  return { name: DB_NAME, openDB, close, putFiles, getFile, get, getAll, count, put, putMany, del, clear, deleteByIndex, getAllByIndex, getMeta, setMeta };
+  }
+  // no database is active until a profile is chosen with use() – nothing can be read or written "by default"
+  let cur = null;
+  /* use(name): make `name` the active database for every LCA.* data call; at(name): a separate handle (e.g. to search other profiles). */
+  function use(name) { if (!cur || cur.name !== name) { if (cur) cur.close(); cur = makeDB(name); } return cur; }
+  function at(name) { return cur && name === cur.name ? cur : makeDB(name); }
+  const fwd = {};
+  for (const k of ['openDB', 'putFiles', 'getFile', 'get', 'getAll', 'count', 'put', 'putMany', 'del', 'clear', 'deleteByIndex', 'getAllByIndex', 'getMeta', 'setMeta']) fwd[k] = (...a) => { if (!cur) return Promise.reject(new Error('No profile selected')); return cur[k](...a); };
+  function deleteDatabase(name) {
+    return new Promise((res, rej) => { if (cur && cur.name === name) { cur.close(); cur = null; } const r = indexedDB.deleteDatabase(name); r.onsuccess = () => res(); r.onerror = () => rej(r.error); r.onblocked = () => setTimeout(res, 3000); });
+  }
 
   /* ---------- Facebook mojibake repair ----------
      Meta's JSON writes every UTF-8 byte as its own \u00XX escape ("Ã¥" instead of "å").
@@ -102,6 +118,6 @@ const LCA = (() => {
   const kindOf = (n) => (EXT[ext(n)] || [0, 'file'])[1];
   const baseName = (p) => (p || '').split('/').pop();
 
-  return { openDB, STORES, putFiles, getFile, get, getAll, count, put, putMany, del, clear, deleteByIndex, getAllByIndex, getMeta, setMeta, fixText, fixDeep, mimeOf, kindOf, ext, baseName };
+  return Object.assign(fwd, { LEGACY_DB, PROFILE_DB_PREFIX, STORES, makeDB, use, at, current: () => cur ? cur.name : null, deleteDatabase, fixText, fixDeep, mimeOf, kindOf, ext, baseName });
 })();
 if (typeof self !== 'undefined') self.LCA = LCA;

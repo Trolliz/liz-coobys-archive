@@ -109,3 +109,31 @@ progress{width:100%;height:12px}
 .hl{background:#fde68a;color:#000;border-radius:3px}
 .snip{font-size:14px;color:var(--ink);white-space:normal}
 @media (min-width:700px){.att-img{max-width:320px;max-height:380px}.b{max-width:65%}}
+/* profiles (v5) */
+.brand{flex:none}
+.profbtn{flex:1 1 auto;min-width:0;max-width:340px;display:flex;align-items:center;gap:6px;border:1px solid var(--line);background:var(--bg);border-radius:999px;padding:4px 10px 4px 6px;font-size:15px;font-weight:600;cursor:pointer;color:var(--ink);margin-right:auto}
+.profbtn .pname{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.profbtn .caret{color:var(--mut);font-size:12px;flex:none}
+.profbtn.busy{opacity:.6}
+.pic{flex:none;display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:50%;background:var(--card);border:1px solid var(--line);font-size:16px;line-height:1}
+.pic.big{width:44px;height:44px;font-size:24px}
+@media (max-width:600px){.brand span{display:none}}
+@media (max-width:380px){.statusbtn span{display:none}}
+.sheet-bg{position:fixed;inset:0;z-index:60;background:rgba(10,8,20,.45);display:flex;align-items:flex-end;justify-content:center}
+.sheet{background:var(--card);width:100%;max-width:600px;max-height:88vh;overflow:auto;border-radius:18px 18px 0 0;padding:16px 14px calc(16px + var(--safe-b));box-shadow:0 -10px 40px rgba(0,0,0,.25)}
+@media (min-width:700px){.sheet-bg{align-items:center}.sheet{border-radius:18px}}
+.profs{margin:6px 0 10px}
+.prow{display:flex;align-items:center;gap:6px;border-bottom:1px solid var(--line)}
+.prow .pick{flex:1;min-width:0;display:flex;align-items:center;gap:10px;background:none;border:0;padding:10px 4px;text-align:left;cursor:pointer;color:var(--ink)}
+.prow .pick .grow{min-width:0;display:flex;flex-direction:column}
+.prow .t1{font-weight:600}
+.prow .t2{font-size:12.5px;color:var(--mut)}
+.prow.on .pick{background:var(--bg);border-radius:12px}
+.into{display:flex;align-items:center;gap:10px;background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:8px 10px}
+.into .pic{width:40px;height:40px;font-size:22px}
+.into .grow{flex:1;min-width:0}
+.into b{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.badge.prof{color:var(--ink);background:var(--card)}
+.suggest{border-color:var(--p)}
+.iconbtn{border:0;background:none;font-size:20px;padding:6px 8px;cursor:pointer;color:var(--ink)}
+.prow .t2{white-space:normal;overflow:visible}

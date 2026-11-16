@@ -1,6 +1,6 @@
 /* Liz Coobys Archive – import / backup worker. Reads ZIPs lazily (random access), never uploads anything. */
 'use strict';
-importScripts('vendor/zip.min.js', 'shared.js');
+importScripts('vendor/zip.min.js?v=5', 'shared.js?v=5');
 zip.configure({ useWebWorkers: false });
 
 const pending = new Map(); let seq = 0;
@@ -12,9 +12,12 @@ onmessage = async (e) => {
   const d = e.data;
   if (d.type === 'reply') { const r = pending.get(d.id); pending.delete(d.id); if (r) r(d.result); return; }
   try {
+    // every job names the profile database it works on, so data can never land in another profile
+    if (d.type === 'importZips' || d.type === 'restore') { if (!d.db) throw new Error('No profile selected'); LCA.use(d.db); }
     if (d.type === 'importZips') { const r = await importZips(d.files); postMessage({ type: 'done', result: r }); }
-    else if (d.type === 'backup') { const blob = await makeBackup(); postMessage({ type: 'backupReady', blob }); }
-    else if (d.type === 'restore') { const r = await restoreBackup(d.file); postMessage({ type: 'done', result: r }); }
+    else if (d.type === 'backup') { const blob = await makeBackup(d.profiles, d.all); postMessage({ type: 'backupReady', blob }); }
+    else if (d.type === 'inspectBackup') { const r = await inspectBackup(d.file); postMessage({ type: 'done', result: r }); }
+    else if (d.type === 'restore') { const r = await restoreBackup(d.file, d.prefix || ''); postMessage({ type: 'done', result: r }); }
   } catch (err) { postMessage({ type: 'error', message: (err && (err.message || String(err))) + '', stack: err && err.stack }); }
 };
 
@@ -62,7 +65,7 @@ async function importZips(fileList) {
   const msgrMedia = [], otherJson = [], unsupported = [], htmlLists = [];
   const sectionStats = new Map();
   const sec = (p) => { const s = p.split('/'); let i = 0; while (i < s.length - 1 && /^(facebook-|your_facebook_activity$|your_activity_across_facebook$|this_profile|data$)/i.test(s[i]) && s.length - i > 2) i++; const top = s.slice(0, Math.min(i + 1, s.length - 1)).join('/') || '(root)'; return top; };
-  let profileEntry = null;
+  let profileEntry = null, foundProfileName = null;
 
   for (const it of all) {
     const p = it.path, segs = p.split('/'), name = segs[segs.length - 1], mi = segs.indexOf('messages');
@@ -82,8 +85,15 @@ async function importZips(fileList) {
   // owner name
   let owner = await LCA.getMeta('owner', null);
   if (profileEntry) {
-    try { const j = LCA.fixDeep(await readJson(profileEntry.e)); const n = j?.profile_v2?.name?.full_name || j?.profile?.name?.full_name || j?.profile_v2?.name; if (typeof n === 'string') { owner = n; await LCA.setMeta('ownerFromProfile', n); } profileEntry.done = true; }
+    let n = null;
+    try { const j = LCA.fixDeep(await readJson(profileEntry.e)); n = j?.profile_v2?.name?.full_name || j?.profile?.name?.full_name || j?.profile_v2?.name; profileEntry.done = true; }
     catch (err) { report.warnings.push('Profile information unreadable: ' + err.message); }
+    if (typeof n === 'string' && n) {
+      // nothing has been written yet: let the user stop if this export seems to belong to another profile
+      const ok = await askMain('confirmProfile', { name: n });
+      if (ok === false) return { cancelled: true, profileName: n };
+      owner = n; foundProfileName = n; await LCA.setMeta('ownerFromProfile', n);
+    }
   }
 
   // peek other JSONs: E2EE secure-storage threads, friends, groups, pages
@@ -240,7 +250,7 @@ async function importZips(fileList) {
   report.updatedAt = Date.now();
   await LCA.setMeta('report', report);
   progress('Finished', 1, 1);
-  return { ok: true };
+  return { ok: true, profileName: foundProfileName };
 }
 
 async function saveMedia(batch) {
@@ -386,6 +396,9 @@ function itemFields(item) {
   if (ts && ts < 1e11) ts *= 1000;
   return { name, url, ts, title };
 }
+/* The export's top folder ("facebook-name-2026-11-15-Xy12ab/") changes with every new download of the same profile.
+   Lists are matched without it, so importing a newer export of the profile replaces the older lists instead of doubling them. */
+const listPath = (p) => (p || '').replace(/^facebook-[^/]*\//i, '');
 async function importList(kind, path, j, report) {
   const items = extractItems(j);
   const recs = []; let i = 0;
@@ -393,30 +406,52 @@ async function importList(kind, path, j, report) {
     const f = key === '__html' ? { name: item.name, url: item.url || null, ts: item.ts || null, title: item.detail || null } : itemFields(item);
     if (!f.name && !f.url && !f.title) continue;
     const category = CAT[key] || (key === '__html' ? LCA.baseName(path).replace(/\.\w+$/, '') : key);
-    recs.push({ id: 'export:' + path + ':' + (i++), source: 'export', file: path, category, name: f.name || null, url: f.url || null, ts: f.ts || null, title: f.title || null, raw: item, storeName: storeFor(category, kind) });
+    recs.push({ id: 'export:' + listPath(path) + ':' + (i++), source: 'export', file: path, category, name: f.name || null, url: f.url || null, ts: f.ts || null, title: f.title || null, raw: item, storeName: storeFor(category, kind) });
   }
   const byStore = {};
   for (const r of recs) (byStore[r.storeName] = byStore[r.storeName] || []).push(r);
   for (const s of ['friends', 'groups', 'pages']) {
     // replace previous records from the same file
-    const old = (await LCA.getAll(s)).filter(x => x.file === path).map(x => x.id);
+    const old = (await LCA.getAll(s)).filter(x => x.source === 'export' && listPath(x.file) === listPath(path)).map(x => x.id);
     for (const id of old) await LCA.del(s, id);
     if (byStore[s]) await LCA.putMany(s, byStore[s]);
   }
+  for (const k of Object.keys(report.lists)) if (k !== path && listPath(k) === listPath(path)) delete report.lists[k];
   report.lists[path] = { kind, records: recs.length, categories: recs.reduce((a, r) => (a[r.category] = (a[r.category] || 0) + 1, a), {}) };
   return recs.length;
 }
 
-/* ---------------- backup ---------------- */
-async function makeBackup() {
+/* ---------------- backup ----------------
+   One profile: the same layout as version 1 (stores/…, media/…, avatars/… at the top), so older copies of the app can restore it.
+   All profiles: each profile in its own folder profiles/N/ with that same layout inside. */
+async function makeBackup(profiles, all) {
   const w = new zip.ZipWriter(new zip.BlobWriter('application/zip'), { bufferedWrite: false });
-  const manifest = { app: 'Liz Coobys Archive', version: 1, createdAt: Date.now(), stores: {} };
+  const manifest = { app: 'Liz Coobys Archive', version: 2, createdAt: Date.now() };
+  if (all) {
+    manifest.kind = 'all-profiles'; manifest.profiles = [];
+    for (let i = 0; i < profiles.length; i++) {
+      const p = profiles[i], dir = `profiles/${i}/`;
+      LCA.use(p.db);
+      const stores = await backupProfile(w, dir, `${p.name} (${i + 1} of ${profiles.length}): `);
+      manifest.profiles.push({ dir, id: p.id, name: p.name, icon: p.icon || null, stores });
+    }
+  } else {
+    const p = profiles[0]; LCA.use(p.db);
+    manifest.kind = 'profile'; manifest.profile = { id: p.id, name: p.name, icon: p.icon || null };
+    manifest.stores = await backupProfile(w, '', '');
+  }
+  await w.add('lizcoobys-backup.json', new zip.TextReader(JSON.stringify(manifest, null, 2)));
+  progress('Finishing backup file', 1, 1);
+  return w.close();
+}
+async function backupProfile(w, dir, label) {
+  const stores = {};
   const textStores = ['threads', 'search', 'friends', 'groups', 'pages', 'meta'];
   let step = 0; const total = textStores.length + 2;
   for (const s of textStores) {
-    const rows = await LCA.getAll(s); manifest.stores[s] = rows.length;
-    await w.add(`stores/${s}.json`, new zip.TextReader(JSON.stringify(rows)));
-    progress('Backing up ' + s, ++step, total);
+    const rows = await LCA.getAll(s); stores[s] = rows.length;
+    await w.add(`${dir}stores/${s}.json`, new zip.TextReader(JSON.stringify(rows)));
+    progress(label + 'Backing up ' + s, ++step, total);
   }
   // messages in chunks
   const d = await LCA.openDB(); let chunk = [], n = 0, part = 0;
@@ -425,45 +460,62 @@ async function makeBackup() {
     c.onsuccess = () => { const cur = c.result; if (!cur) return res(); chunk.push(cur.value); n++; cur.continue(); };
     c.onerror = () => rej(c.error);
   });
-  for (let k = 0; k < chunk.length; k += 5000) await w.add(`stores/messages-${String(part++).padStart(4, '0')}.json`, new zip.TextReader(JSON.stringify(chunk.slice(k, k + 5000))));
-  manifest.stores.messages = n; chunk = null;
-  progress('Backing up media', 0, 1);
+  for (let k = 0; k < chunk.length; k += 5000) await w.add(`${dir}stores/messages-${String(part++).padStart(4, '0')}.json`, new zip.TextReader(JSON.stringify(chunk.slice(k, k + 5000))));
+  stores.messages = n; chunk = null;
+  progress(label + 'Backing up media', 0, 1);
   const keys = await new Promise((res, rej) => { const r = d.transaction('media').objectStore('media').getAllKeys(); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
   const mediaMeta = [];
   for (let k = 0; k < keys.length; k++) {
-    const meta = await LCA.get('media', keys[k]); const file = `media/${String(k).padStart(6, '0')}.${LCA.ext(meta.name) || 'bin'}`;
+    const meta = await LCA.get('media', keys[k]); const file = `${dir}media/${String(k).padStart(6, '0')}.${LCA.ext(meta.name) || 'bin'}`;
     const blob = await LCA.getFile(keys[k]); delete meta.blob; meta.file = blob ? file : null; mediaMeta.push(meta);
     if (blob) await w.add(file, new zip.BlobReader(blob), { level: 0 });
-    if (k % 20 === 0) progress('Backing up media', k, keys.length);
+    if (k % 20 === 0) progress(label + 'Backing up media', k, keys.length);
   }
-  await w.add('stores/media.json', new zip.TextReader(JSON.stringify(mediaMeta)));
+  await w.add(`${dir}stores/media.json`, new zip.TextReader(JSON.stringify(mediaMeta)));
   const av = await LCA.getAll('avatars'); const avMeta = [];
-  for (let k = 0; k < av.length; k++) { const { blob, ...meta } = av[k]; meta.file = `avatars/${k}.img`; avMeta.push(meta); if (blob) await w.add(meta.file, new zip.BlobReader(blob), { level: 0 }); }
-  await w.add('stores/avatars.json', new zip.TextReader(JSON.stringify(avMeta)));
-  manifest.stores.media = mediaMeta.length; manifest.stores.avatars = avMeta.length;
-  await w.add('lizcoobys-backup.json', new zip.TextReader(JSON.stringify(manifest, null, 2)));
-  progress('Finishing backup file', 1, 1);
-  return w.close();
+  for (let k = 0; k < av.length; k++) { const { blob, ...meta } = av[k]; meta.file = `${dir}avatars/${k}.img`; avMeta.push(meta); if (blob) await w.add(meta.file, new zip.BlobReader(blob), { level: 0 }); }
+  await w.add(`${dir}stores/avatars.json`, new zip.TextReader(JSON.stringify(avMeta)));
+  stores.media = mediaMeta.length; stores.avatars = avMeta.length;
+  return stores;
 }
-async function restoreBackup(file) {
+/* What is inside a backup file (old single-profile backups have version 1 and no profile name). */
+async function inspectBackup(file) {
   const r = new zip.ZipReader(new zip.BlobReader(file)); const es = await r.getEntries();
   const by = new Map(es.map(e => [e.filename, e]));
   const man = by.get('lizcoobys-backup.json'); if (!man) throw new Error('This is not a Liz Coobys Archive backup file.');
   const manifest = JSON.parse(await man.getData(new zip.TextWriter()));
+  const readMeta = async (dir) => { const e = by.get(dir + 'stores/meta.json'); if (!e) return {}; try { const rows = JSON.parse(await e.getData(new zip.TextWriter())); const o = {}; for (const x of rows) if (x && (x.key === 'ownerFromProfile' || x.key === 'owner' || x.key === 'profileName')) o[x.key] = x.value; return o; } catch (err) { return {}; } };
+  const out = [];
+  if (manifest.kind === 'all-profiles' && Array.isArray(manifest.profiles)) {
+    for (const p of manifest.profiles) out.push(Object.assign({ dir: p.dir, name: p.name || null, icon: p.icon || null, stores: p.stores || {} }, { meta: await readMeta(p.dir) }));
+  } else {
+    out.push({ dir: '', name: manifest.profile?.name || null, icon: manifest.profile?.icon || null, stores: manifest.stores || {}, meta: await readMeta('') });
+  }
+  await r.close();
+  return { version: manifest.version || 1, kind: manifest.kind || 'profile', createdAt: manifest.createdAt || null, profiles: out };
+}
+async function restoreBackup(file, prefix) {
+  const r = new zip.ZipReader(new zip.BlobReader(file)); const es = await r.getEntries();
+  const by = new Map(es.map(e => [e.filename, e]));
+  const man = by.get('lizcoobys-backup.json'); if (!man) throw new Error('This is not a Liz Coobys Archive backup file.');
+  const manifest = JSON.parse(await man.getData(new zip.TextWriter()));
+  if (!by.has(prefix + 'stores/threads.json') && !by.has(prefix + 'stores/meta.json')) throw new Error('This profile was not found in the backup file.');
   await LCA.clear(LCA.STORES);
-  for (const s of ['threads', 'search', 'friends', 'groups', 'pages', 'meta']) { const e = by.get(`stores/${s}.json`); if (e) await LCA.putMany(s, JSON.parse(await e.getData(new zip.TextWriter()))); progress('Restoring ' + s, 0, 1); }
-  const parts = es.filter(e => /^stores\/messages-\d+\.json$/.test(e.filename)).sort((a, b) => a.filename < b.filename ? -1 : 1);
+  for (const s of ['threads', 'search', 'friends', 'groups', 'pages', 'meta']) { const e = by.get(`${prefix}stores/${s}.json`); if (e) await LCA.putMany(s, JSON.parse(await e.getData(new zip.TextWriter()))); progress('Restoring ' + s, 0, 1); }
+  const re = new RegExp('^' + prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + 'stores/messages-\\d+\\.json$');
+  const parts = es.filter(e => re.test(e.filename)).sort((a, b) => a.filename < b.filename ? -1 : 1);
   for (let k = 0; k < parts.length; k++) { const rows = JSON.parse(await parts[k].getData(new zip.TextWriter())); for (let q = 0; q < rows.length; q += 2000) await LCA.putMany('messages', rows.slice(q, q + 2000)); progress('Restoring messages', k + 1, parts.length); }
   for (const [s, f] of [['media', 'stores/media.json'], ['avatars', 'stores/avatars.json']]) {
-    const e = by.get(f); if (!e) continue; const meta = JSON.parse(await e.getData(new zip.TextWriter())); let batch = [];
+    const e = by.get(prefix + f); if (!e) continue; const meta = JSON.parse(await e.getData(new zip.TextWriter())); let batch = [];
     for (let k = 0; k < meta.length; k++) {
-      const m = meta[k]; const fe = m.file ? by.get(m.file) : null; delete m.file;
+      const m = meta[k]; const fe = m.file ? (by.get(m.file) || by.get(prefix + m.file)) : null; delete m.file;
       if (fe) m.blob = await fe.getData(new zip.BlobWriter(m.mime || 'application/octet-stream'));
       batch.push(m); if (batch.length >= 25) { await (s === 'media' ? saveMedia(batch.filter(x => x.blob)).then(() => LCA.putMany('media', batch.filter(x => !x.blob))) : LCA.putMany(s, batch)); batch = []; }
       if (k % 20 === 0) progress('Restoring ' + s, k, meta.length);
     }
     if (batch.length) await (s === 'media' ? saveMedia(batch.filter(x => x.blob)).then(() => LCA.putMany('media', batch.filter(x => !x.blob))) : LCA.putMany(s, batch));
   }
+  await r.close();
   progress('Finished', 1, 1);
-  return { ok: true, restored: manifest.stores };
+  return { ok: true, restored: manifest.stores || null };
 }
