@@ -118,6 +118,12 @@ const LCA = (() => {
   const kindOf = (n) => (EXT[ext(n)] || [0, 'file'])[1];
   const baseName = (p) => (p || '').split('/').pop();
 
-  return Object.assign(fwd, { LEGACY_DB, PROFILE_DB_PREFIX, STORES, makeDB, use, at, current: () => cur ? cur.name : null, deleteDatabase, fixText, fixDeep, mimeOf, kindOf, ext, baseName });
+  // an independent copy with its own active database (used when the import helper runs inside the page)
+  function fork() {
+    let c = null; const f = {};
+    for (const k of Object.keys(fwd)) f[k] = (...a) => { if (!c) return Promise.reject(new Error('No profile selected')); return c[k](...a); };
+    return Object.assign(f, { STORES, LEGACY_DB, PROFILE_DB_PREFIX, use: (n) => { if (!c || c.name !== n) { if (c) c.close(); c = makeDB(n); } return c; }, at: (n) => c && c.name === n ? c : makeDB(n), current: () => c ? c.name : null, fixText, fixDeep, mimeOf, kindOf, ext, baseName });
+  }
+  return Object.assign(fwd, { fork, LEGACY_DB, PROFILE_DB_PREFIX, STORES, makeDB, use, at, current: () => cur ? cur.name : null, deleteDatabase, fixText, fixDeep, mimeOf, kindOf, ext, baseName });
 })();
 if (typeof self !== 'undefined') self.LCA = LCA;

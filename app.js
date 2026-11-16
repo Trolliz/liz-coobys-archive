@@ -97,35 +97,113 @@ async function cacheAvatars(urls, label, L) {
   return { ok, fail, total: todo.length };
 }
 
-/* ---------- worker ---------- */
-let worker = null, workerDone = null;
-function getWorker() {
+/* ---------- import helper (worker) ----------
+   The helper normally runs as a Web Worker. It must say "ready" (with the same version as this screen) within 15 s;
+   otherwise it is stopped and the same code is loaded into the page instead, so imports still work – only slower. */
+const APP_VERSION = '6';
+let worker = null, workerDone = null, workerMode = null, workerStarting = null;
+async function onWorkerMessage(e) {
+  const d = e.data; if (!d) return;
+  S.lastBeat = Date.now();
+  if (d.type === 'progress') setProgress(d.phase, d.done, d.total, d.note);
+  else if (d.type === 'parseMessageHtml') worker.postMessage({ type: 'reply', id: d.id, result: safe(() => Parsers.parseMessageHtml(d.text)) });
+  else if (d.type === 'parseHtmlList') worker.postMessage({ type: 'reply', id: d.id, result: safe(() => Parsers.parseHtmlList(d.text)) });
+  else if (d.type === 'confirmProfile') worker.postMessage({ type: 'reply', id: d.id, result: await confirmProfileName(d.name).catch(() => true) });
+  else if (d.type === 'isBackup') { workerDone && workerDone.resolve({ backup: true }); }
+  else if (d.type === 'done' || d.type === 'backupReady') { workerDone && workerDone.resolve(d.type === 'done' ? (d.result || {}) : d); }
+  else if (d.type === 'error') { workerDone && workerDone.reject(new Error(d.message)); }
+}
+function startRealWorker() {
+  return new Promise((resolve, reject) => {
+    let w; try { w = new Worker('worker.js?v=' + APP_VERSION); } catch (e) { return reject(e); }
+    const timer = setTimeout(() => { w.terminate(); reject(new Error('the background helper did not start within 15 seconds')); }, 15000);
+    w.onmessage = (e) => {
+      if (!e.data || e.data.type !== 'ready') return;
+      clearTimeout(timer);
+      if (e.data.version !== APP_VERSION) { w.terminate(); return reject(new Error(`the background helper is version ${e.data.version}, this screen is version ${APP_VERSION}`)); }
+      w.onmessage = onWorkerMessage;
+      w.onerror = (ev) => { ev.preventDefault && ev.preventDefault(); const msg = 'The import helper stopped unexpectedly' + (ev.message ? ': ' + ev.message : ' (the phone may have run out of memory)') + '.'; worker = null; try { w.terminate(); } catch (x) { } workerDone && workerDone.reject(new Error(msg)); };
+      resolve(w);
+    };
+    w.onerror = (ev) => { ev.preventDefault && ev.preventDefault(); clearTimeout(timer); try { w.terminate(); } catch (x) { } reject(new Error('the background helper could not be loaded' + (ev.message ? ' (' + ev.message + ')' : ''))); };
+  });
+}
+function loadInlineHelper() {
+  return new Promise((resolve, reject) => {
+    if (self.LCAInlineWorker) return resolve();
+    const sc = document.createElement('script'); sc.src = 'worker.js?v=' + APP_VERSION;
+    sc.onload = () => self.LCAInlineWorker ? resolve() : reject(new Error('helper code missing')); sc.onerror = () => reject(new Error('could not load worker.js'));
+    document.head.append(sc);
+  });
+}
+async function getWorker() {
   if (worker) return worker;
-  worker = new Worker('worker.js?v=5');
-  worker.onmessage = async (e) => {
-    const d = e.data;
-    if (d.type === 'progress') setProgress(d.phase, d.done, d.total, d.note);
-    else if (d.type === 'parseMessageHtml') worker.postMessage({ type: 'reply', id: d.id, result: safe(() => Parsers.parseMessageHtml(d.text)) });
-    else if (d.type === 'parseHtmlList') worker.postMessage({ type: 'reply', id: d.id, result: safe(() => Parsers.parseHtmlList(d.text)) });
-    else if (d.type === 'confirmProfile') worker.postMessage({ type: 'reply', id: d.id, result: await confirmProfileName(d.name).catch(() => true) });
-    else if (d.type === 'isBackup') { workerDone && workerDone.resolve({ backup: true }); }
-    else if (d.type === 'done' || d.type === 'backupReady') { workerDone && workerDone.resolve(d.type === 'done' ? (d.result || {}) : d); }
-    else if (d.type === 'error') { workerDone && workerDone.reject(new Error(d.message)); }
-  };
-  worker.onerror = (e) => { workerDone && workerDone.reject(new Error(e.message || 'Worker failed')); };
-  return worker;
+  if (workerStarting) return workerStarting;
+  workerStarting = (async () => {
+    try { worker = await startRealWorker(); workerMode = 'worker'; }
+    catch (err) {
+      console.warn('worker failed, using in-page helper', err);
+      setProgress('Starting the import helper', 0, 1, `Note: ${err.message}. Importing inside the page instead – this works, but the screen may react slowly while it runs.`);
+      await loadInlineHelper();
+      if (self.LCAInlineWorker.version !== APP_VERSION) throw new Error('This screen and the app files do not match (an update is half-loaded). Please reload the page and try again.');
+      worker = self.LCAInlineWorker.create(onWorkerMessage); workerMode = 'inline';
+    }
+    return worker;
+  })();
+  try { return await workerStarting; } finally { workerStarting = null; }
 }
+function stopWorker() { if (worker) { try { worker.terminate(); } catch (e) { } worker = null; } }
 function safe(f) { try { return f(); } catch (e) { console.error(e); return null; } }
-function runWorker(msg) { return new Promise((resolve, reject) => { workerDone = { resolve, reject }; getWorker().postMessage(msg); }); }
-
-/* ---------- progress UI ---------- */
-function setProgress(phase, done, total, note) {
-  const p = $('#prog'); if (!p) return;
-  p.hidden = false;
-  $('#progPhase').textContent = phase + (total > 1 ? ` (${fmtN(done)} of ${fmtN(total)})` : '');
-  $('#progBar').max = total || 1; $('#progBar').value = done || 0;
-  $('#progNote').textContent = note || '';
+async function runWorker(msg) {
+  const w = await getWorker();
+  return new Promise((resolve, reject) => { workerDone = { resolve, reject }; S.lastBeat = Date.now(); w.postMessage(msg); });
 }
+
+/* ---------- progress UI ----------
+   The last status is remembered, so it is shown again when the Import page is redrawn, and a ticker shows
+   that the app is still alive (and for how long nothing new happened) while something runs. */
+function setProgress(phase, done, total, note) {
+  S.lastProg = { phase, done, total, note, at: Date.now() };
+  drawProgress();
+}
+function drawProgress() {
+  const p = $('#prog'), lp = S.lastProg; if (!p || !lp) return;
+  showProgBox();
+  $('#progPhase').textContent = lp.phase + (lp.total > 1 ? ` (${fmtN(lp.done)} of ${fmtN(lp.total)})` : '');
+  const bar = $('#progBar');
+  if (S.busy && !(lp.total > 1)) bar.removeAttribute('value'); else { bar.max = lp.total || 1; bar.value = lp.done || 0; }
+  $('#progNote').textContent = lp.note || '';
+  const quiet = Math.round((Date.now() - Math.max(lp.at, S.lastBeat || 0)) / 1000), el = $('#progTick');
+  if (el) el.textContent = S.busy ? `⏳ Working for ${fmtDur((Date.now() - (S.busySince || lp.at)) / 1000)}` + (quiet >= 15 ? ` · no news for ${fmtDur(quiet)}` : '') : '';
+  const warn = $('#progWarn');
+  if (warn) { const slow = S.busy && quiet >= 90; warn.hidden = !slow; if (slow) warn.textContent = `⚠️ Nothing has happened for ${fmtDur(quiet)}. Big files can take long on a phone, but if this does not change: tap “Stop”, make sure the file is stored on the phone itself (not only in Google Drive), close the app completely and try again.`; }
+  const st = $('#statusBtn span'); if (st) st.textContent = S.busy ? 'Working…' : 'Import & status';
+  const sb = $('#progStop'); if (sb) sb.hidden = !S.busy;
+}
+const fmtDur = (s) => { s = Math.max(0, Math.round(s)); return s < 60 ? s + ' s' : Math.floor(s / 60) + ' min ' + String(s % 60).padStart(2, '0') + ' s'; };
+setInterval(() => { if (S.busy) drawProgress(); }, 1000);
+function showError(title, msg) {
+  S.lastError = { title, msg, at: Date.now() }; drawError();
+}
+function drawError() {
+  const e = $('#progErr'); if (!e) return; const x = S.lastError;
+  e.hidden = !x; e.innerHTML = ''; if (x) showProgBox(); else { const c = $('#progCard'); if (c && !S.busy && !S.lastProg) c.hidden = true; }
+  if (x) e.append(h('b', null, '❌ ' + x.title), h('div', null, x.msg), h('button', { class: 'btn', style: 'margin-top:6px', onclick: () => { S.lastError = null; drawError(); } }, 'OK'));
+}
+async function stopImport() {
+  if (!S.busy) return;
+  if (!confirm('Stop what is running now? Whatever was already saved stays; you can import the same files again later.')) return;
+  stopWorker(); S.stopped = true;
+  workerDone && workerDone.reject(new Error('Stopped by you.'));
+}
+/* Anything that goes wrong anywhere must be visible – never fail silently. */
+function errorBanner(msg) {
+  let b = $('#errBanner');
+  if (!b) { b = h('div', { id: 'errBanner', class: 'errbanner', role: 'alert' }); document.body.append(b); }
+  b.innerHTML = ''; b.append(h('div', { class: 'grow' }, '❌ Something went wrong: ' + msg), h('button', { class: 'btn', onclick: () => location.reload() }, 'Reload'), h('button', { class: 'btn', onclick: () => b.remove() }, '✕'));
+}
+window.addEventListener('error', (e) => { if (e.message && !/ResizeObserver/.test(e.message)) errorBanner(e.message); });
+window.addEventListener('unhandledrejection', (e) => { const m = e.reason && (e.reason.message || String(e.reason)); if (m) errorBanner(m); });
 
 /* ---------- storage ---------- */
 async function storageInfo() {
@@ -147,22 +225,32 @@ async function importFiles(fileList) {
   const files = [...fileList]; if (!files.length) return;
   // everything below writes only into the profile that was selected when the import started (switching is locked meanwhile)
   const P = S.profile, L = LCA.at(P.db);
-  S.busy = true; $('#statusBtn')?.classList.add('attn'); drawProfileBtn();
-  const prog = $('#prog'); if (prog) prog.hidden = false;
-  const log = []; let backupFile = null, foundName = null;
+  S.busy = true; S.busySince = Date.now(); S.stopped = false; S.lastError = null; drawError(); $('#statusBtn')?.classList.add('attn'); drawProfileBtn();
+  setProgress('Starting import', 0, 1, `${files.length} file(s) selected: ` + files.map(f => `${f.name} (${fmtBytes(f.size)})`).join(', '));
+  const log = []; let backupFile = null, foundName = null, failed = false;
   try {
-    await askPersist();
+    // never wait forever for the browser's storage answers
+    await Promise.race([askPersist(), new Promise(r => setTimeout(r, 3000))]);
     const isAsset = (f) => /_files\//.test(f.webkitRelativePath || '');
-    const zips = files.filter(f => /\.zip$/i.test(f.name) || f.type === 'application/zip' || f.type === 'application/x-zip-compressed');
-    const htmls = files.filter(f => /\.html?$/i.test(f.name) && !zips.includes(f) && !isAsset(f));
+    // decide by the file's content, not by its name or type (Android pickers often give no type or a generic one)
+    const kinds = new Map();
+    for (let k = 0; k < files.length; k++) kinds.set(files[k], await sniffFile(files[k], k + 1, files.length));
+    const zips = files.filter(f => kinds.get(f) === 'zip');
+    const htmls = files.filter(f => kinds.get(f) === 'html' && !isAsset(f));
     const others = files.filter(f => !zips.includes(f) && !htmls.includes(f));
-    if (!(await checkSpace(zips.reduce((a, f) => a + f.size, 0)))) throw new Error('Import cancelled');
+    for (const f of others) if (kinds.get(f) === 'empty') log.push(`⚠️ ${f.name} is empty (0 bytes) – nothing to import. Download it again.`);
+    if (!(await Promise.race([checkSpace(zips.reduce((a, f) => a + f.size, 0)), new Promise(r => setTimeout(() => r(true), 5000))]))) throw new Error('Import cancelled');
     if (zips.length) {
-      setProgress('Reading ZIP', 0, 1);
-      const r = await runWorker({ type: 'importZips', files: zips, db: P.db });
+      // make sure every ZIP can actually be read quickly; slow phone/Drive files are copied into the app first
+      const ready = [];
+      for (let k = 0; k < zips.length; k++) ready.push(await readableZip(zips[k], k + 1, zips.length));
+      setProgress('Starting the import helper', 0, 1);
+      const r = await runWorker({ type: 'importZips', files: ready, db: P.db });
       if (r && r.backup) { backupFile = zips[0]; log.push('That file is a Liz Coobys Archive backup – see the restore options.'); }
       else if (r && r.cancelled) log.push(`Import stopped before anything was saved (export belongs to “${r.profileName}”).`);
+      else if (r && r.ok === false) { failed = true; throw new Error((r.openErrors || []).join('\n') || 'No files could be read from the ZIP.'); }
       else { log.push(`Facebook export imported into “${P.name}”: ${zips.map(z => z.name).join(', ')}`); foundName = r && r.profileName; }
+      if (r && r.openErrors && r.openErrors.length && r.ok) { log.push('⚠️ ' + r.openErrors.join(' · ')); showError('Some files could not be opened', r.openErrors.join('\n')); }
     }
     for (const f of htmls) {
       setProgress('Reading ' + f.name, 0, 1);
@@ -181,17 +269,66 @@ async function importFiles(fileList) {
       log.push(`${others.length} other file(s) listed in the report (no archive data in them)`);
     }
     S.xcache.clear(); await loadState(true);
+    if (!zips.length && !htmls.length) { failed = true; throw new Error('None of the selected files is a Facebook export (.zip) or a saved friends / Groups / pages page (.html).' + (log.length ? '\n' + log.join('\n') : '')); }
     setProgress('Done', 1, 1, log.join(' · '));
     toast(backupFile ? 'Backup file found' : 'Import finished');
     if (foundName && normName(foundName) !== normName(P.name)) toast(`This export belongs to “${foundName}” – you can rename the profile below`, 5000);
   } catch (e) {
-    console.error(e); setProgress('Import stopped', 0, 1, e.message);
-    alert('Import problem: ' + e.message + (/quota|space|full/i.test(e.message) ? '\n\nThe device seems to be out of storage space.' : ''));
+    console.error(e); failed = true;
+    const msg = (e && e.message || String(e)) + (/quota|space|full/i.test(e && e.message || '') ? '\n\nThe device seems to be out of storage space.' : '');
+    setProgress('Import stopped', 0, 1, msg); showError(S.stopped ? 'Import stopped' : 'Import problem', msg);
+    if (!S.stopped) alert('Import problem: ' + msg);
   } finally {
-    S.busy = false; $('#statusBtn')?.classList.remove('attn'); drawProfileBtn(); await loadState(true);
-    if (location.hash.startsWith('#/import')) { const note = $('#progNote')?.textContent; await render(); setProgress('Done', 1, 1, note); }
+    S.busy = false; S.stopped = false; $('#statusBtn')?.classList.remove('attn'); drawProfileBtn();
+    if (S.updateWaiting) toast('A new version of the app is ready – reload the page when convenient', 8000);
+    try { await loadState(true); } catch (e) { console.error(e); }
+    if (location.hash.startsWith('#/import')) { await render(); drawProgress(); drawError(); }
+    else toast(failed ? 'Import problem – see Import & status' : 'Import finished', 5000);
   }
   if (backupFile) await restoreFlow(backupFile);
+}
+/* What is this file? Looks at the first bytes. Shows a ticking status while the phone hands the file over. */
+async function withTicker(promise, phase, note) {
+  const t0 = Date.now(); let n = 0;
+  const iv = setInterval(() => { n = (Date.now() - t0) / 1000; setProgress(phase, 0, 1, note(n)); }, 1000);
+  try { return await promise; } finally { clearInterval(iv); }
+}
+const driveHint = 'If the file is in Google Drive, the phone may be downloading it first – that can take several minutes for a big file. If nothing changes, download it to the phone (Drive → ⋮ → Download) and choose it from “Downloads”.';
+async function readSlice(f, a, b) {
+  try { return new Uint8Array(await f.slice(a, b).arrayBuffer()); }
+  catch (e) { throw new Error(`The phone could not read “${f.name}” (${e.name || 'error'}: ${e.message}). ${driveHint}`); }
+}
+async function sniffFile(f, k, n) {
+  if (!f.size) return 'empty';
+  const head = await withTicker(readSlice(f, 0, 512), `Checking file ${k} of ${n}: ${f.name}`, (s) => s < 3 ? '' : `Waiting for the phone to hand over the file… ${fmtDur(s)}. ` + (s >= 8 ? driveHint : ''));
+  if (head[0] === 0x50 && head[1] === 0x4b && (head[2] === 3 || head[2] === 5 || head[2] === 7)) return 'zip';
+  const txt = new TextDecoder('utf-8', { fatal: false }).decode(head).replace(/^\ufeff/, '').trimStart().toLowerCase();
+  if (/\.html?$/i.test(f.name) || /^(<!doctype html|<html|<!-- saved from|<head|<meta)/.test(txt)) return 'html';
+  if (/\.zip$/i.test(f.name)) throw new Error(`“${f.name}” is called .zip but is not a ZIP file (it may be damaged or only partly downloaded). Download it again.`);
+  return 'other';
+}
+/* zip.js reads a ZIP by jumping around in the file. Normal phone files allow that. Some Android sources (e.g. a file
+   picked straight from Google Drive) deliver the bytes only slowly or in order; reading such a file at random places can
+   look like a freeze. So: test-read the end and the middle; if that is not fast, copy the file into the app once,
+   in pieces, with a visible MB counter, and import from the copy. */
+async function readableZip(f, k, n) {
+  const label = n > 1 ? `Opening file ${k} of ${n}: ${f.name}` : `Opening ${f.name}`;
+  const probe = (async () => { const t = Date.now(); await readSlice(f, Math.max(0, f.size - 65536), f.size); await readSlice(f, Math.floor(f.size / 2), Math.floor(f.size / 2) + 65536); return Date.now() - t; })();
+  probe.catch(() => {});
+  const fast = await withTicker(Promise.race([probe, new Promise(r => setTimeout(() => r(null), 4000))]), label, (s) => `Checking that the file can be read… ${fmtDur(s)}`);
+  if (fast != null && fast < 2500) return f;
+  setProgress(label, 0, f.size, 'This file is delivered slowly by the phone, so it is copied into the app first.');
+  const CH = 4 * 1048576, parts = []; let pos = 0; const t0 = Date.now();
+  while (pos < f.size) {
+    if (S.stopped) throw new Error('Stopped by you.');
+    const end = Math.min(f.size, pos + CH);
+    parts.push(await withTicker(readSlice(f, pos, end), label, () => `Copying the file into the app: ${fmtBytes(pos)} of ${fmtBytes(f.size)} – waiting for the phone… ${driveHint}`));
+    pos = end;
+    const secs = (Date.now() - t0) / 1000, rate = pos / Math.max(secs, 0.1);
+    setProgress(label, pos, f.size, `Copying the file into the app: ${fmtBytes(pos)} of ${fmtBytes(f.size)}` + (secs > 3 ? ` · about ${fmtDur((f.size - pos) / rate)} left` : ''));
+  }
+  try { return new File(parts, f.name, { type: 'application/zip' }); }
+  catch (e) { return new Blob(parts, { type: 'application/zip' }); }
 }
 async function noteIgnored(L, list) {
   const rep = await L.getMeta('report', null) || {}; rep.ignoredUploads = (rep.ignoredUploads || []).concat(list).slice(-5000);
@@ -226,8 +363,10 @@ async function render() {
   }
   document.body.classList.toggle('chat', tab === 'thread');
   for (const a of document.querySelectorAll('#nav a')) a.classList.toggle('on', a.dataset.tab === tab || (tab === 'thread' && a.dataset.tab === 'messenger'));
+  if (tab === 'import') { view.innerHTML = ''; view.append(h('h2', null, 'Import & status'), statusBox()); drawProgress(); drawError(); }
   await loadState();
-  view.innerHTML = '';
+  if (tab !== 'import') view.innerHTML = '';
+  else for (const el of [...view.children].slice(2)) el.remove();
   try {
     if (tab === 'thread') await renderThread(decodeURIComponent(parts[1] || ''), parts[2] != null && parts[2] !== '' ? +parts[2] : null);
     else if (tab === 'media') await renderMedia();
@@ -714,6 +853,15 @@ async function renderSearch(qfull) {
 }
 
 /* ---------- Import & status ---------- */
+/* The status box is drawn first and without waiting for the database, so it is visible at once even while an import keeps the database busy. */
+function statusBox() {
+  return h('div', { id: 'progCard', class: 'card', hidden: !S.busy && !S.lastProg && !S.lastError },
+    h('div', { id: 'prog', hidden: !S.busy && !S.lastProg }, h('div', { id: 'progPhase', class: 'small' }, 'Working…'), h('progress', { id: 'progBar', max: 1, value: 0 }), h('div', { id: 'progNote', class: 'mut small' }),
+      h('div', { id: 'progTick', class: 'mut small' }), h('div', { id: 'progWarn', class: 'note', hidden: true }),
+      h('button', { id: 'progStop', class: 'btn danger', style: 'margin-top:6px', hidden: !S.busy, onclick: stopImport }, '■ Stop')),
+    h('div', { id: 'progErr', class: 'errbox', hidden: true }));
+}
+function showProgBox() { const c = $('#progCard'), p = $('#prog'); if (c) c.hidden = false; if (p) p.hidden = false; }
 async function renderImport() {
   const st = await storageInfo();
   const fileInput = (accept, multiple, dir) => { const i = h('input', { type: 'file', accept: accept || null, multiple, hidden: true }); if (dir) i.setAttribute('webkitdirectory', ''); i.addEventListener('change', () => { importFiles(i.files); }); return i; };
@@ -723,7 +871,7 @@ async function renderImport() {
   const ios = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
   const standalone = navigator.standalone || matchMedia('(display-mode: standalone)').matches;
   const P = S.profile, stats = await profileStats(LCA);
-  view.append(h('h2', null, 'Import & status'), installCard() || '',
+  view.append(installCard() || '',
     (await nameSuggestionCard()) || "",
     h('div', { class: 'card' },
       h('div', { class: 'into' }, h('span', { class: 'pic' }, P.icon || '👤'), h('div', { class: 'grow' }, h('div', { class: 'small mut' }, 'Everything you import now goes into the profile'), h('b', null, P.name)),
@@ -737,8 +885,7 @@ async function renderImport() {
         h('button', { class: 'btn big', onclick: () => htmlI.click() }, '🌐 Saved Facebook pages (friends / Groups / pages .html)'),
         h('button', { class: 'btn big', onclick: () => dirI.click() }, '📁 A whole folder, e.g. “Liz Coobys” (computer)'),
         h('div', { class: 'mut small' }, 'The “…_files” folders saved next to the .html pages only contain Facebook’s scripts and styles (no names or pictures), so they are optional. If you add them they are listed in the report.')),
-      any, zipI, htmlI, dirI, restI,
-      h('div', { id: 'prog', hidden: !S.busy, style: 'margin-top:10px' }, h('div', { id: 'progPhase', class: 'small' }, 'Working…'), h('progress', { id: 'progBar', max: 1, value: 0 }), h('div', { id: 'progNote', class: 'mut small' }))),
+      any, zipI, htmlI, dirI, restI),
     await reportView(),
     h('div', { class: 'card' }, h('h3', { style: 'margin-top:0' }, '💾 Storage'),
       h('div', null, h('b', null, `${P.icon || '👤'} ${P.name}: `), statsLine(stats)),
@@ -762,7 +909,7 @@ async function ownerCard() {
   return h('div', { class: 'card' }, h('h3', { style: 'margin-top:0' }, '🙋 Which name is you?'), h('div', { class: 'small mut' }, 'Your own messages are shown on the right in blue.'), sel);
 }
 async function doBackup(all) {
-  if (S.busy) return toast('Please wait – something is still running'); S.busy = true; drawProfileBtn(); $('#prog').hidden = false;
+  if (S.busy) return toast('Please wait – something is still running'); S.busy = true; drawProfileBtn(); showProgBox();
   const list = (all ? S.profiles : [S.profile]).map(p => ({ id: p.id, name: p.name, icon: p.icon || null, db: p.db }));
   try {
     const r = await runWorker({ type: 'backup', profiles: list, all: !!all }); const d = new Date().toISOString().slice(0, 10);
@@ -993,7 +1140,6 @@ async function renameProfile(p, name, icon) {
   const L = LCA.at(p.db); await L.setMeta('profileName', name); await L.setMeta('profileIcon', np.icon);
   S.profiles = await PR.all(); if (S.profile.id === p.id) S.profile = S.profiles.find(x => x.id === p.id); S.xcache.clear(); drawProfileBtn();
 }
-function stopWorker() { if (worker) { worker.terminate(); worker = null; } }
 async function deleteProfile(p) {
   if (S.busy) return toast('Please wait until the import / backup has finished');
   if (S.profiles.length < 2) return toast('The last profile cannot be deleted');
@@ -1051,7 +1197,7 @@ async function restoreFlow(file) {
   if (!choice) return;
   if (choice === 'replace' && !confirm(`Replace everything in “${S.profile.name}” with the backup? Other profiles are not touched.`)) return;
   if (choice === 'replaceAll' && !confirm(`Replace ALL profiles on this device with the ${ps.length} profiles from the backup? Profiles that are not in the backup will be deleted.`)) return;
-  S.busy = true; drawProfileBtn(); const prog = $('#prog'); if (prog) prog.hidden = false;
+  S.busy = true; drawProfileBtn(); showProgBox();
   const done = [];
   try {
     // each profile is restored into a fresh database first; old data is removed only after that succeeded
@@ -1098,7 +1244,17 @@ function uniqueName(n, list) { let out = n, k = 2; while (list.some(p => normNam
 // a page loaded from an older cached index.html has no profile button yet – add it
 if (!$('#profBtn')) { const b = h('button', { type: 'button', id: 'profBtn', class: 'profbtn', 'aria-label': 'Switch profile' }); const br = $('.brand'); if (br) br.after(b); else $('#top').prepend(b); }
 $('#profBtn').addEventListener('click', () => openProfileSheet());
-if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register('sw.js').catch(e => console.warn('SW', e));
+if ('serviceWorker' in navigator && location.protocol !== 'file:') {
+  navigator.serviceWorker.register('sw.js').catch(e => console.warn('SW', e));
+  // when a new version takes over, load it (never in the middle of an import – then offer it afterwards)
+  const hadController = !!navigator.serviceWorker.controller; let reloading = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (!hadController || reloading) return;
+    if (S.busy) { S.updateWaiting = true; return; }
+    reloading = true; location.reload();
+  });
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') navigator.serviceWorker.getRegistration().then(r => r && r.update()).catch(() => { }); });
+}
 (async () => {
   if (typeof LCA.use !== 'function') {
     // old shared.js from the browser cache next to the new app.js: reload once to get matching files

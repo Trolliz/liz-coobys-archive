@@ -1,25 +1,36 @@
-/* Liz Coobys Archive – import / backup worker. Reads ZIPs lazily (random access), never uploads anything. */
+/* Liz Coobys Archive – import / backup helper. Reads ZIPs lazily (random access), never uploads anything.
+   Normally runs as a Web Worker. If the worker cannot start on a device, the app loads this same file into the page
+   and runs it there instead (slower, but it works) – see LCAInlineWorker at the end. */
 'use strict';
-importScripts('vendor/zip.min.js?v=5', 'shared.js?v=5');
+(function () {
+const VERSION = '6';
+const IN_WORKER = typeof WorkerGlobalScope !== 'undefined' && self instanceof WorkerGlobalScope;
+if (IN_WORKER) importScripts('vendor/zip.min.js?v=6', 'shared.js?v=6');
 zip.configure({ useWebWorkers: false });
+// in the page, use a separate handle so the helper never changes which profile the screen shows
+const LCA = IN_WORKER ? self.LCA : self.LCA.fork();
+let send = IN_WORKER ? (m) => self.postMessage(m) : () => {};
 
 const pending = new Map(); let seq = 0;
-function askMain(type, payload) { return new Promise(res => { const id = ++seq; pending.set(id, res); postMessage(Object.assign({ type, id }, payload)); }); }
-const progress = (phase, done, total, note) => postMessage({ type: 'progress', phase, done, total, note });
-const log = (msg) => postMessage({ type: 'log', msg });
+function askMain(type, payload) { return new Promise(res => { const id = ++seq; pending.set(id, res); send(Object.assign({ type, id }, payload)); }); }
+const progress = (phase, done, total, note) => send({ type: 'progress', phase, done, total, note });
+const log = (msg) => send({ type: 'log', msg });
 
-onmessage = async (e) => {
+async function handle(e) {
   const d = e.data;
   if (d.type === 'reply') { const r = pending.get(d.id); pending.delete(d.id); if (r) r(d.result); return; }
   try {
-    // every job names the profile database it works on, so data can never land in another profile
-    if (d.type === 'importZips' || d.type === 'restore') { if (!d.db) throw new Error('No profile selected'); LCA.use(d.db); }
-    if (d.type === 'importZips') { const r = await importZips(d.files); postMessage({ type: 'done', result: r }); }
-    else if (d.type === 'backup') { const blob = await makeBackup(d.profiles, d.all); postMessage({ type: 'backupReady', blob }); }
-    else if (d.type === 'inspectBackup') { const r = await inspectBackup(d.file); postMessage({ type: 'done', result: r }); }
-    else if (d.type === 'restore') { const r = await restoreBackup(d.file, d.prefix || ''); postMessage({ type: 'done', result: r }); }
-  } catch (err) { postMessage({ type: 'error', message: (err && (err.message || String(err))) + '', stack: err && err.stack }); }
-};
+    // every job names the profile database it works on, so data can never land in another profile.
+    // A screen from an older version of the app (before profiles) sends no profile: ask for a reload instead of guessing.
+    if ((d.type === 'importZips' || d.type === 'restore') && !d.db) throw new Error('The app was updated in the background. Please reload the page (or close the app completely and open it again), then import again.');
+    if (d.db) LCA.use(d.db);
+    if (d.type === 'ping') send({ type: 'ready', version: VERSION });
+    else if (d.type === 'importZips') { const r = await importZips(d.files); send({ type: 'done', result: r }); }
+    else if (d.type === 'backup') { const blob = await makeBackup(d.profiles, d.all); send({ type: 'backupReady', blob }); }
+    else if (d.type === 'inspectBackup') { const r = await inspectBackup(d.file); send({ type: 'done', result: r }); }
+    else if (d.type === 'restore') { const r = await restoreBackup(d.file, d.prefix || ''); send({ type: 'done', result: r }); }
+  } catch (err) { send({ type: 'error', message: (err && (err.message || String(err))) + '', stack: err && err.stack }); }
+}
 
 const MEDIA_KINDS = new Set(['photo', 'gif', 'video', 'audio']);
 const norm = (p) => p.replace(/\\/g, '/').replace(/^\.?\/+/, '');
@@ -38,12 +49,14 @@ async function importZips(fileList) {
   const report = Object.assign(newReport(), await LCA.getMeta('report', null) || {});
   report.warnings = []; report.unreadableFiles = []; report.emptySections = [];
   const all = []; // {e, path, zipName}
-  for (const f of fileList) {
-    progress('Opening ' + f.name, 0, 1);
+  const openErrors = [];
+  for (let k = 0; k < fileList.length; k++) {
+    const f = fileList[k], label = fileList.length > 1 ? `Opening file ${k + 1} of ${fileList.length}: ${f.name}` : 'Opening ' + f.name;
+    progress(label, 0, 1, `${fmtSize(f.size)} – reading the list of files inside the ZIP…`);
     const reader = new zip.ZipReader(new zip.BlobReader(f));
     let entries;
-    try { entries = await reader.getEntries(); }
-    catch (err) { report.warnings.push(`Could not open “${f.name}” as a ZIP: ${err.message}`); continue; }
+    try { entries = await reader.getEntries({ onprogress: (i, n) => { if (i % 500 === 0 || i === n) progress(label, i, n, 'Reading the list of files inside the ZIP'); } }); }
+    catch (err) { const msg = `Could not open “${f.name}” as a ZIP: ${err.message}`; report.warnings.push(msg); openErrors.push(msg); continue; }
     const files = entries.filter(x => !x.directory);
     if (files.some(x => /(^|\/)lizcoobys-backup\.json$/.test(x.filename))) return { backup: true };
     report.sources = report.sources.filter(s => s.name !== f.name);
@@ -51,7 +64,8 @@ async function importZips(fileList) {
     report.sources.push({ name: f.name, size: f.size, entries: files.length, importedAt: Date.now() });
     for (const x of files) all.push({ e: x, path: norm(x.filename), zipName: f.name });
   }
-  if (!all.length) { await LCA.setMeta('report', report); return { ok: false }; }
+  if (!all.length) { await LCA.setMeta('report', report); return { ok: false, openErrors }; }
+  progress('Sorting ' + all.length.toLocaleString() + ' files', 1, 1);
 
   // indexes for resolving attachment paths (works across multi-part exports)
   const byPath = new Map(), byTail = new Map(), byBase = new Map();
@@ -250,13 +264,14 @@ async function importZips(fileList) {
   report.updatedAt = Date.now();
   await LCA.setMeta('report', report);
   progress('Finished', 1, 1);
-  return { ok: true, profileName: foundProfileName };
+  return { ok: true, profileName: foundProfileName, openErrors };
 }
 
 async function saveMedia(batch) {
   await LCA.putFiles(batch);
   await LCA.putMany('media', batch.map(({ blob, ...m }) => m));
 }
+function fmtSize(b) { return b >= 1048576 ? (b / 1048576).toFixed(1) + ' MB' : Math.round((b || 0) / 1024) + ' KB'; }
 function pushCap(arr, v, cap = 5000) { if (arr.length < cap) arr.push(v); }
 function newReport() {
   return {
@@ -519,3 +534,16 @@ async function restoreBackup(file, prefix) {
   progress('Finished', 1, 1);
   return { ok: true, restored: manifest.stores || null };
 }
+
+if (IN_WORKER) { self.onmessage = handle; send({ type: 'ready', version: VERSION }); }
+else {
+  // page fallback: an object that behaves like a Worker
+  self.LCAInlineWorker = {
+    version: VERSION,
+    create(onmessage) {
+      send = (m) => setTimeout(() => onmessage({ data: m }), 0);
+      return { inline: true, postMessage: (m) => setTimeout(() => handle({ data: m }), 0), terminate() { send = () => {}; } };
+    }
+  };
+}
+})();
