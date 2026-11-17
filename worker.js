@@ -3,9 +3,9 @@
    and runs it there instead (slower, but it works) – see LCAInlineWorker at the end. */
 'use strict';
 (function () {
-const VERSION = '7';
+const VERSION = '8';
 const IN_WORKER = typeof WorkerGlobalScope !== 'undefined' && self instanceof WorkerGlobalScope;
-if (IN_WORKER) importScripts('vendor/zip.min.js?v=7', 'shared.js?v=7');
+if (IN_WORKER) importScripts('vendor/zip.min.js?v=8', 'shared.js?v=8');
 zip.configure({ useWebWorkers: false });
 // in the page, use a separate handle so the helper never changes which profile the screen shows
 const LCA = IN_WORKER ? self.LCA : self.LCA.fork();
@@ -56,7 +56,7 @@ async function importZips(fileList) {
   for (let k = 0; k < fileList.length; k++) {
     const f = fileList[k], label = fileList.length > 1 ? `Opening file ${k + 1} of ${fileList.length}: ${f.name}` : 'Opening ' + f.name;
     progress(label, 0, 1, `${fmtSize(f.size)} – reading the list of files inside the ZIP…`);
-    const reader = new zip.ZipReader(new zip.BlobReader(f));
+    const reader = new zip.ZipReader(new zip.BlobReader(f), { strictness: 'tolerant' }); // v8: Messenger's secure-storage ZIP sets the data-descriptor flag only in local headers; zip.js's default strictness rejects every entry as "Ambiguous archive"
     let entries;
     try { entries = await reader.getEntries({ onprogress: (i, n) => { if (i % 500 === 0 || i === n) progress(label, i, n, 'Reading the list of files inside the ZIP'); } }); }
     catch (err) { const msg = `Could not open “${f.name}” as a ZIP: ${err.message}`; report.warnings.push(msg); openErrors.push(msg); continue; }
@@ -140,9 +140,28 @@ async function importZips(fileList) {
 
   /* ---- Messenger threads ---- */
   const allThreads = [...threadFiles.values()];
+  const e2eeKeys = new Set();
   for (const t of e2eeThreads) {
     const folder = t.it.path.replace(/\.json$/i, '').split('/').slice(-2).join('_');
-    allThreads.push({ key: 'e2ee_export/' + folder, category: 'e2ee_export', folder, dir: t.it.path.split('/').slice(0, -1).join('/'), files: [t.it], preJson: t.j });
+    // Messenger's "secure storage" download: one JSON per chat, named "<Name>_<number>.json" – the number can change between
+    // downloads, so the chat is identified by its participants (+ name); importing a newer download replaces the older one.
+    const ps = (Array.isArray(t.j.participants) ? t.j.participants : []).map(p => typeof p === 'string' ? p : (p && (p.name || p.full_name)) || '').filter(Boolean);
+    let key = ps.length ? 'e2ee_export/' + ps.map(x => LCA.fixText(x)).sort().join(' + ') + (ps.length > 2 && t.j.threadName ? ' · ' + LCA.fixText(t.j.threadName) : '') : 'e2ee_export/' + folder;
+    while (e2eeKeys.has(key)) key += ' (2)'; e2eeKeys.add(key);
+    allThreads.push({ key, category: 'e2ee_export', folder, dir: t.it.path.split('/').slice(0, -1).join('/'), files: [t.it], preJson: t.j });
+  }
+  // an earlier import of the same file (older app version, or chat file numbers that changed) is replaced, not duplicated
+  if (e2eeThreads.length) {
+    const zipNames = new Set(all.map(x => x.zipName));
+    for (const t of await LCA.getAll('threads')) if (t.category === 'e2ee_export' && !t.id.startsWith('merged/') && !e2eeKeys.has(t.id) && zipNames.has(t.source)) await removeThread(t.id);
+  }
+  // photos/videos stored next to those chat files (e.g. media/<id>.jpeg) belong to Messenger: keep them, also when no message points to them
+  if (e2eeThreads.length) {
+    const dirs = [...new Set(e2eeThreads.map(t => t.it.path.split('/').slice(0, -1).join('/')))];
+    for (let k = unsupported.length - 1; k >= 0; k--) {
+      const it = unsupported[k];
+      if (dirs.some(d => d === '' || it.path.startsWith(d + '/')) && /(^|\/)media\//.test(it.path) && LCA.kindOf(it.path) !== 'file') { msgrMedia.push(it); it.cls = 'msgrMedia'; unsupported.splice(k, 1); }
+    }
   }
   const M = report.messenger;
   const participantFreq = new Map();
@@ -197,7 +216,8 @@ async function importZips(fileList) {
       for (const a of n.att) {
         TS.referenced++;
         if (/^https?:\/\//i.test(a.uri || '')) { a.remote = true; TS.remote++; continue; }
-        if (!a.uri) { a.missing = true; TS.missing++; missing++; pushCap(TS.missingList, { thread: title || th.folder, threadId, uri: '(no file name given)', kind: a.kind }); continue; }
+        if (a.uri && !/[\/.]/.test(a.uri)) { a.note = a.uri; a.uri = ''; }
+        if (!a.uri) { a.missing = true; TS.missing++; missing++; pushCap(TS.missingList, { thread: title || th.folder, threadId, uri: a.note ? `(${a.note})` : '(no file name given)', kind: a.kind }); continue; }
         const hit = resolve(a.uri, th, byPath, byTail, byBase);
         if (!hit) { a.missing = true; TS.missing++; missing++; pushCap(TS.missingList, { thread: title || th.folder, threadId, uri: a.uri, kind: a.kind }); continue; }
         a.mediaId = hit.path; used.add(hit.path);
@@ -252,6 +272,7 @@ async function importZips(fileList) {
     if (best && bc >= Math.max(2, allThreads.length * 0.5)) owner = best;
   }
   if (owner) await LCA.setMeta('owner', owner);
+  await mergePass(owner);
 
   // section summary — every file in the ZIP is accounted for
   for (const it of all) {
@@ -270,6 +291,68 @@ async function importZips(fileList) {
   return { ok: true, profileName: foundProfileName, openErrors };
 }
 
+/* ---------------- merging chats that appear in two sources ----------------
+   Meta's normal export often holds only the older part of a chat (or a short "E2EE cutover" stub), while Messenger's secure-storage
+   download holds the end-to-end encrypted part. Both stay stored as imported (so re-importing either one replaces only that one);
+   for viewing, each secure-storage chat is combined with the export chats that have exactly the same people into one conversation
+   "merged/…". A message present in both sources appears once. The combined chat keeps the E2EE label. Rebuilt after every import. */
+const MERGEABLE = new Set(['inbox', 'archived_threads', 'e2ee_cutover', 'message_requests', 'filtered_threads']);
+async function mergePass(owner) {
+  const all = await LCA.getAll('threads');
+  for (const t of all) if (t.id.startsWith('merged/')) await removeMergedThread(t.id);
+  const ths = all.filter(t => !t.id.startsWith('merged/'));
+  for (const t of ths) if (t.mergedInto) { delete t.mergedInto; await LCA.put('threads', t); }
+  const sec = ths.filter(t => t.category === 'e2ee_export');
+  if (!sec.length) return;
+  // who is "me": the export owner and whoever is in (nearly) every secure-storage chat
+  const me = new Set([owner, await LCA.getMeta('ownerFromProfile', null)].filter(Boolean).map(normN));
+  const freq = new Map(); for (const t of sec) for (const p of new Set(t.participants.map(normN))) freq.set(p, (freq.get(p) || 0) + 1);
+  for (const [p, c] of freq) if (sec.length >= 2 && c >= sec.length * 0.9) me.add(p);
+  const others = (t) => [...new Set(t.participants.map(normN))].filter(p => p && !me.has(p)).sort().join('|');
+  const byKey = new Map();
+  for (const t of ths) if (MERGEABLE.has(t.category)) { const k = others(t); if (k) { if (!byKey.has(k)) byKey.set(k, []); byKey.get(k).push(t); } }
+  const used = new Set(); let gi = 0;
+  for (const s of sec) {
+    const k = others(s); const partners = (byKey.get(k) || []).filter(x => !used.has(x.id));
+    if (!k || !partners.length) continue;
+    gi++; progress('Combining encrypted chats with the export', gi, sec.length);
+    const srcs = [s, ...partners]; partners.forEach(x => used.add(x.id));
+    const lists = [];
+    for (const t of srcs) lists.push((await LCA.getAllByIndex('messages', 'thread', IDBKeyRange.bound([t.id, -Infinity], [t.id, Infinity]))).map(m => ({ m, t })));
+    // the secure-storage messages first: on a duplicate, that copy is kept
+    const keep = [], seen = new Map(); let dups = 0;
+    const sig = (m) => { const who = me.has(normN(m.sender)) ? '<me>' : normN(m.sender); const body = (m.text || '').trim() || (m.att || []).map(a => a.kind).join(',') || (m.share && m.share.link) || (m.unsent ? '<unsent>' : ''); return who + '|' + body; };
+    for (const list of lists) for (const { m, t } of list) {
+      const g = sig(m), arr = seen.get(g) || [];
+      if (m.ts != null && arr.some(ts => ts != null && Math.abs(ts - m.ts) <= 2000)) { dups++; continue; }
+      arr.push(m.ts); seen.set(g, arr); keep.push({ m, t });
+    }
+    keep.sort((a, b) => (a.m.ts ?? -Infinity) - (b.m.ts ?? -Infinity));
+    const id = 'merged/' + k; const msgs = [], texts = [], ords = [];
+    keep.forEach(({ m, t }, i) => {
+      const c = Object.assign({}, m, { threadId: id, ord: i, id: id + '#' + String(i).padStart(7, '0'), src: { thread: t.id, ord: m.ord, category: t.category } }); delete c.raw;
+      msgs.push(c);
+      const st = [c.text, c.share && c.share.text, c.share && c.share.link, ...(c.att || []).map(a => a.name)].filter(Boolean).join(' ').toLowerCase();
+      if (st) { texts.push(st); ords.push(i); }
+    });
+    for (let q = 0; q < msgs.length; q += 2000) await LCA.putMany('messages', msgs.slice(q, q + 2000));
+    await LCA.put('search', { threadId: id, ords, texts });
+    const last = msgs[msgs.length - 1];
+    await LCA.put('threads', {
+      id, category: 'e2ee_export', folder: s.folder, title: s.title, participants: [...new Set(srcs.flatMap(t => t.participants))], senders: [...new Set(srcs.flatMap(t => t.senders || []))],
+      msgCount: msgs.length, firstTs: msgs.find(m => m.ts != null)?.ts ?? null, lastTs: last?.ts ?? null, lastText: last ? previewOf(last) : '', lastSender: last?.sender || '',
+      mediaCount: srcs.reduce((a, t) => a + (t.mediaCount || 0), 0), missingMedia: srcs.reduce((a, t) => a + (t.missingMedia || 0), 0), format: 'merged',
+      mergedFrom: srcs.map(t => ({ id: t.id, category: t.category, msgCount: t.msgCount })), duplicatesDropped: dups, warnings: srcs.flatMap(t => t.warnings || []), fixedStrings: srcs.reduce((a, t) => a + (t.fixedStrings || 0), 0)
+    });
+    for (const t of srcs) { t.mergedInto = id; await LCA.put('threads', t); }
+  }
+}
+function normN(n) { return (n || '').normalize('NFC').toLowerCase().replace(/\s+/g, ' ').trim(); }
+async function removeMergedThread(id) {
+  await LCA.deleteByIndex('messages', 'thread', IDBKeyRange.bound([id, -Infinity], [id, Infinity]));
+  await LCA.del('search', id); await LCA.del('threads', id);
+}
+
 async function saveMedia(batch) {
   await LCA.putFiles(batch);
   await LCA.putMany('media', batch.map(({ blob, ...m }) => m));
@@ -285,17 +368,15 @@ function newReport() {
 }
 async function recountMessenger(report) {
   const ths = await LCA.getAll('threads'); const M = report.messenger;
-  Object.assign(M, { threads: ths.length, messages: 0, byCategory: {}, formats: {}, mojibakeFixed: 0, emptyThreads: [], missingList: [], unreadableList: [], threadWarnings: [],
+  Object.assign(M, { threads: ths.filter(t => !t.mergedInto).length, merged: ths.filter(t => t.mergedFrom).length, duplicatesDropped: ths.reduce((a, t) => a + (t.duplicatesDropped || 0), 0), messages: 0, byCategory: {}, formats: {}, mojibakeFixed: 0, emptyThreads: [], missingList: [], unreadableList: [], threadWarnings: [],
     media: { referenced: 0, found: 0, missing: 0, unreadable: 0, remote: 0, unreferencedStored: 0, byKind: {} } });
   for (const t of ths) {
+    if (!t.mergedFrom) { const s = t.mediaStats; if (s) { for (const k of ['referenced', 'found', 'missing', 'unreadable', 'remote']) M.media[k] += s[k] || 0; for (const [k, v] of Object.entries(s.byKind || {})) M.media.byKind[k] = (M.media.byKind[k] || 0) + v; for (const x of s.missingList || []) pushCap(M.missingList, x); for (const x of s.unreadableList || []) pushCap(M.unreadableList, x); } }
+    if (t.mergedInto) continue; // shown as part of a combined chat
     M.messages += t.msgCount; const c = M.byCategory[t.category] = M.byCategory[t.category] || { threads: 0, messages: 0 }; c.threads++; c.messages += t.msgCount;
     M.formats[t.format] = (M.formats[t.format] || 0) + 1; M.mojibakeFixed += t.fixedStrings || 0;
     if (!t.msgCount) M.emptyThreads.push(t.title);
     for (const w of t.warnings || []) M.threadWarnings.push(t.title + ': ' + w);
-    const s = t.mediaStats; if (!s) continue;
-    for (const k of ['referenced', 'found', 'missing', 'unreadable', 'remote']) M.media[k] += s[k] || 0;
-    for (const [k, v] of Object.entries(s.byKind || {})) M.media.byKind[k] = (M.media.byKind[k] || 0) + v;
-    for (const x of s.missingList || []) pushCap(M.missingList, x); for (const x of s.unreadableList || []) pushCap(M.unreadableList, x);
   }
   let total = 0, unref = 0; const d = await LCA.openDB();
   await new Promise((res, rej) => { const c = d.transaction('media').objectStore('media').openCursor(); c.onsuccess = () => { const cur = c.result; if (!cur) return res(); total++; if (cur.value.referenced === false) unref++; cur.continue(); }; c.onerror = () => rej(c.error); });

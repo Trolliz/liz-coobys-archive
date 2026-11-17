@@ -29,10 +29,12 @@ function toast(msg, ms = 2600) { const t = $('#toast'); t.textContent = msg; t.h
 const S = { owner: null, threads: null, report: null, searchIdx: null, urls: [], busy: false, profile: null, profiles: [], searchScope: 'this', xcache: new Map() };
 async function loadState(force) {
   if (!S.threads || force) {
-    S.threads = (await LCA.getAll('threads')).sort((a, b) => (b.lastTs || 0) - (a.lastTs || 0));
+    const allT = await LCA.getAll('threads');
+    // chats combined into one conversation ("merged/…") are listed once; their parts stay reachable by link
+    S.threads = allT.filter(t => !t.mergedInto).sort((a, b) => (b.lastTs || 0) - (a.lastTs || 0));
     S.owner = await LCA.getMeta('owner', null);
     S.report = await LCA.getMeta('report', null);
-    S.threadMap = new Map(S.threads.map(t => [t.id, t]));
+    S.threadMap = new Map(allT.map(t => [t.id, t]));
     if (force) S.searchIdx = null;
   }
 }
@@ -100,7 +102,7 @@ async function cacheAvatars(urls, label, L) {
 /* ---------- import helper (worker) ----------
    The helper normally runs as a Web Worker. It must say "ready" (with the same version as this screen) within 15 s;
    otherwise it is stopped and the same code is loaded into the page instead, so imports still work – only slower. */
-const APP_VERSION = '7';
+const APP_VERSION = '8';
 let worker = null, workerDone = null, workerMode = null, workerStarting = null, workerJob = 0;
 async function onWorkerMessage(e) {
   const d = e.data; if (!d) return;
@@ -505,7 +507,9 @@ async function renderThread(id, focusOrd) {
     t.missingMedia ? h('div', { style: 'color:var(--warn)' }, `⚠️ ${t.missingMedia} attachment(s) are referenced in the messages but were not included in the export.`) : null,
     t.fixedStrings ? h('div', null, `Repaired Facebook’s character encoding in ${fmtN(t.fixedStrings)} text field(s) (å ä ö, emoji). The original export text is kept unchanged in the archive.`) : null,
     (t.warnings || []).map(w => h('div', { style: 'color:var(--warn)' }, '⚠️ ' + w)),
-    t.format === 'html' ? h('div', null, 'Imported from Meta’s HTML export format; dates shown as written by Meta.') : null);
+    t.format === 'html' ? h('div', null, 'Imported from Meta’s HTML export format; dates shown as written by Meta.') : null,
+    t.mergedFrom ? h('div', null, '🔗 Combined from: ' + t.mergedFrom.map(x => `${x.category === 'e2ee_export' ? 'Messenger secure storage (encrypted chats)' : catLabel(x.category) + ' (Facebook export)'} – ${fmtN(x.msgCount)} msgs`).join(' + ') + (t.duplicatesDropped ? `. ${fmtN(t.duplicatesDropped)} message(s) were in both and are shown once.` : '.')) : null,
+    t.mergedInto ? h('div', null, '🔗 This is one part of a combined conversation. ', h('a', { href: '#/thread/' + encodeURIComponent(t.mergedInto) }, 'Open the whole conversation')) : null);
   view.append(head, info, box);
   const PAGE = 250;
   let lo, hi;
@@ -576,7 +580,7 @@ const KIND_LABEL = { photo: 'Photo', gif: 'GIF', sticker: 'Sticker', video: 'Vid
 function renderAtt(a, m) {
   const id = a.mediaId;
   if (a.remote) return h('a', { class: 'filechip', href: a.uri, target: '_blank', rel: 'noopener noreferrer' }, '🔗 ' + (KIND_LABEL[a.kind] || 'Link') + ' (online link, not stored)');
-  if (a.missing || a.unreadable || !id) return h('span', { class: 'filechip missing', title: a.uri || '' }, `⚠️ ${KIND_LABEL[a.kind] || 'File'} ${a.unreadable ? 'could not be read' : 'not included in export'}: ${a.name || ''}`);
+  if (a.missing || a.unreadable || !id) return h('span', { class: 'filechip missing', title: a.uri || '' }, `⚠️ ${KIND_LABEL[a.kind] || 'File'} ${a.unreadable ? 'could not be read' : a.note ? 'could not be downloaded by Messenger' : 'not included in export'}: ${a.note || a.name || ''}`);
   const dl = h('button', { class: 'dl', onclick: () => downloadMedia(id) }, '⤓ Save');
   if (a.kind === 'photo' || a.kind === 'gif' || a.kind === 'sticker') {
     const img = lazy(h('img', { class: 'att-img' + (a.kind === 'sticker' ? ' sticker' : ''), alt: a.name || '', 'data-media': id, decoding: 'async' }));
@@ -641,7 +645,7 @@ async function exportConversation(t, mode) {
   const files = [];
   const rows = msgs.map(m => {
     const att = (m.att || []).map(a => {
-      if (a.missing || !a.mediaId) return `<div class="miss">⚠️ ${esc(KIND_LABEL[a.kind] || 'File')} not included in export: ${esc(a.name || a.uri)}</div>`;
+      if (a.missing || !a.mediaId) return `<div class="miss">⚠️ ${esc(KIND_LABEL[a.kind] || 'File')} ${a.note ? 'could not be downloaded by Messenger' : 'not included in export'}: ${esc(a.note || a.name || a.uri)}</div>`;
       const fn = 'media/' + a.mediaId.split('/').slice(-3).join('_');
       if (mode !== 'zip') return `<div class="miss">[${esc(KIND_LABEL[a.kind])}: ${esc(a.name)}]</div>`;
       files.push([fn, a.mediaId]);
@@ -880,6 +884,7 @@ async function renderSearch(qfull) {
   const hits = []; let total = 0, scanned = 0;
   for (const c of ctxs) for (const [tid, s] of c.idx) {
     if (onlyThread && tid !== onlyThread) continue;
+    if (!onlyThread && c.threadMap.get(tid)?.mergedInto) continue; // found in the combined chat instead
     scanned += s.texts.length;
     for (let i = 0; i < s.texts.length; i++) if (s.texts[i].includes(ql)) { total++; hits.push([c, tid, s.ords[i]]); }
   }
@@ -888,7 +893,7 @@ async function renderSearch(qfull) {
   const pb = (c) => all ? profBadge(c.p) : null;
   const fm = (arr) => arr.filter(r => normName((r.name || '') + ' ' + (r.username || '') + ' ' + (r.fbId || '') + ' ' + (r.title || '')).includes(qn));
   if (onlyThread) view.append(h('div', { class: 'mut small' }, 'In conversation: ', h('a', { href: '#/thread/' + encodeURIComponent(onlyThread) }, S.threadMap.get(onlyThread)?.title || '')));
-  const convs = onlyThread ? [] : ctxs.flatMap(c => c.threads.filter(t => normName(t.title + ' ' + t.participants.join(' ')).includes(qn)).map(t => [c, t])).slice(0, 80);
+  const convs = onlyThread ? [] : ctxs.flatMap(c => c.threads.filter(t => !t.mergedInto).filter(t => normName(t.title + ' ' + t.participants.join(' ')).includes(qn)).map(t => [c, t])).slice(0, 80);
   if (convs.length) view.append(h('h3', null, `Conversations (${convs.length})`), h('ul', { class: 'list card', style: 'padding:0 8px' }, convs.map(([c, t]) => h('li', null, h('a', { class: 'item', href: href(c, 'thread/' + encodeURIComponent(t.id)) }, avatar(t.title), h('div', { class: 'grow' }, h('div', { class: 't1' }, t.title), h('div', { class: 't2' }, `${fmtN(t.msgCount)} messages · ${catLabel(t.category)}`), pb(c)))))));
   const msgBox = h('ul', { class: 'list card', style: 'padding:0 8px' });
   const LIMIT = 300;
@@ -1009,6 +1014,7 @@ async function reportView() {
     h('table', { class: 'rep' },
       sub('💬 Messenger'),
       row('Conversations', M.threads || 0), row('Messages', M.messages || 0),
+      M.merged ? row(' · Encrypted chats combined with the export', `${fmtN(M.merged)} chats · ${fmtN(M.duplicatesDropped || 0)} duplicate msgs shown once`) : null,
       Object.entries(M.byCategory || {}).map(([k, v]) => row(' · ' + catLabel(k), `${fmtN(v.threads)} chats · ${fmtN(v.messages)} msgs`)),
       row('Text fields with Facebook’s encoding repaired (å ä ö, emoji)', M.mojibakeFixed || 0),
       row('Attachments referenced in messages', md.referenced || 0), row('Media files found & stored', md.found || 0, 'ok'),
@@ -1143,7 +1149,8 @@ function drawProfileBtn() {
   document.title = S.profile.name + ' · Liz Coobys Archive';
 }
 async function profileStats(L) {
-  const [threads, messages, friends, groups, pages] = await Promise.all(['threads', 'messages', 'friends', 'groups', 'pages'].map(s => L.count(s)));
+  const [friends, groups, pages] = await Promise.all(['friends', 'groups', 'pages'].map(s => L.count(s)));
+  const vis = (await L.getAll('threads')).filter(t => !t.mergedInto); const threads = vis.length, messages = vis.reduce((a, t) => a + (t.msgCount || 0), 0);
   let media = 0, mediaBytes = 0; const d = await L.openDB();
   await new Promise((res, rej) => { const c = d.transaction('media').objectStore('media').openCursor(); c.onsuccess = () => { const cur = c.result; if (!cur) return res(); media++; mediaBytes += cur.value.size || 0; cur.continue(); }; c.onerror = () => rej(c.error); });
   return { threads, messages, friends, groups, pages, media, mediaBytes, lastBackup: await L.getMeta('lastBackup', null), fbName: await L.getMeta('ownerFromProfile', null) };
