@@ -3,9 +3,9 @@
    and runs it there instead (slower, but it works) – see LCAInlineWorker at the end. */
 'use strict';
 (function () {
-const VERSION = '9';
+const VERSION = '10';
 const IN_WORKER = typeof WorkerGlobalScope !== 'undefined' && self instanceof WorkerGlobalScope;
-if (IN_WORKER) importScripts('vendor/zip.min.js?v=9', 'shared.js?v=9');
+if (IN_WORKER) importScripts('vendor/zip.min.js?v=10', 'shared.js?v=10');
 zip.configure({ useWebWorkers: false });
 // in the page, use a separate handle so the helper never changes which profile the screen shows
 const LCA = IN_WORKER ? self.LCA : self.LCA.fork();

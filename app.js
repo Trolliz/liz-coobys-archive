@@ -65,6 +65,7 @@ const AV_MIME = { mp4: 'video/mp4', m4v: 'video/mp4', mov: 'video/quicktime', we
 function avBlob(b, name, isVideo) {
   let t = AV_MIME[LCA.ext(name)] || (b.type && b.type !== 'application/octet-stream' ? b.type : '') || (isVideo ? 'video/mp4' : 'audio/mpeg');
   if (isVideo && t === 'audio/ogg') t = 'video/ogg';
+  if (!isVideo && /^video\//.test(t)) t = t === 'video/ogg' ? 'audio/ogg' : t === 'video/webm' ? 'audio/webm' : 'audio/mp4';
   return b.type === t ? b : b.slice(0, b.size, t);
 }
 async function sniffCodec(b) {
@@ -77,7 +78,53 @@ async function sniffCodec(b) {
   } catch (e) { }
   return '';
 }
-function setAvSrc(el, b, id) {
+/* v10: what a media file really is, from its first bytes – not its name. Messenger's secure-storage download names
+   video preview pictures (JPEG/PNG) “.mp4”, and some “.mp4” files hold only sound. Done at display time, so files that
+   are already stored are shown right without importing again. */
+const realKind = new Map();
+async function sniffReal(b, id) {
+  if (realKind.has(id)) return realKind.get(id);
+  let r = { kind: 'unknown' };
+  try {
+    const h0 = new Uint8Array(await b.slice(0, 64).arrayBuffer()), at = (i, s) => [...s].every((c, k) => h0[i + k] === c.charCodeAt(0));
+    if (h0[0] === 0xff && h0[1] === 0xd8 && h0[2] === 0xff) r = { kind: 'image', mime: 'image/jpeg' };
+    else if (h0[0] === 0x89 && at(1, 'PNG')) r = { kind: 'image', mime: 'image/png' };
+    else if (at(0, 'GIF8')) r = { kind: 'image', mime: 'image/gif' };
+    else if (at(0, 'RIFF') && at(8, 'WEBP')) r = { kind: 'image', mime: 'image/webp' };
+    else if (at(4, 'ftyp')) {
+      if (at(8, 'M4A ') || at(8, 'M4B ')) r = { kind: 'audio', mime: 'audio/mp4' };
+      else { // look at the track handlers ('hdlr' … 'vide'/'soun') in the movie header, at the start or the end of the file
+        const N = 4 << 20, parts = [new Uint8Array(await b.slice(0, N).arrayBuffer())]; if (b.size > N) parts.push(new Uint8Array(await b.slice(-N).arrayBuffer()));
+        let vide = false, soun = false;
+        for (const a of parts) for (let i = 0; i + 16 <= a.length; i++) if (a[i] === 0x68 && a[i + 1] === 0x64 && a[i + 2] === 0x6c && a[i + 3] === 0x72) { const t = String.fromCharCode(a[i + 12], a[i + 13], a[i + 14], a[i + 15]); if (t === 'vide') vide = true; else if (t === 'soun') soun = true; }
+        r = soun && !vide ? { kind: 'audio', mime: 'audio/mp4' } : { kind: 'video' };
+      }
+    } else if (at(0, 'OggS')) { const a = new Uint8Array(await b.slice(0, 4096).arrayBuffer()); const txt = String.fromCharCode(...a); r = /theora|OVP80/.test(txt) ? { kind: 'video' } : { kind: 'audio', mime: 'audio/ogg' }; }
+  } catch (e) { }
+  realKind.set(id, r); return r;
+}
+const PREVIEW_LABEL = 'Messenger only included a preview picture of this video';
+async function setAvSrc(el, b, id) {
+  const real = await sniffReal(b, id);
+  if (!el.isConnected && !el.closest('.vwrap')) return;
+  const tile = el.closest('.tile'), inViewer = !!el.closest('.vwrap');
+  if (real.kind === 'image') {
+    const img = h('img', { class: tile ? '' : 'att-img', alt: PREVIEW_LABEL, decoding: 'async', src: track(URL.createObjectURL(b.slice(0, b.size, real.mime))) });
+    if (tile) { el.replaceWith(img); return; }
+    const label = h('div', { class: 'avnote info' }, 'ℹ️ ' + PREVIEW_LABEL);
+    el.replaceWith(img); img.after(label);
+    if (inViewer) label.after(h('button', { class: 'dl', onclick: () => downloadMedia(id) }, '⤓ Save'));
+    return;
+  }
+  if (real.kind === 'audio' && el.tagName === 'VIDEO') {
+    if (tile) { el.replaceWith(h('div', { class: 'avph' }, '🎤')); return; }
+    const au = h('audio', { controls: true, preload: 'metadata', 'data-media': id, autoplay: inViewer ? true : null });
+    el.replaceWith(au); el = au;
+    if (inViewer) au.after(h('button', { class: 'dl', onclick: () => downloadMedia(id) }, '⤓ Save'));
+  }
+  return setAvSrcNow(el, b, id);
+}
+function setAvSrcNow(el, b, id) {
   const name = LCA.baseName(id), isVideo = el.tagName === 'VIDEO';
   let tries = 0;
   const onErr = async () => {
@@ -98,7 +145,8 @@ function setAvSrc(el, b, id) {
 }
 async function downloadMedia(id) {
   const m = await LCA.get('media', id); const b = await LCA.getFile(id); if (!m || !b) return toast('File not available');
-  saveBlob(/^(video|audio)$/.test(m.kind) ? avBlob(b, m.name, m.kind === 'video') : b, m.name);
+  const real = /^(video|audio)$/.test(m.kind) ? await sniffReal(b, id) : null;
+  saveBlob(real && real.kind === 'image' ? b.slice(0, b.size, real.mime) : real ? avBlob(b, m.name, real.kind !== 'audio' && m.kind === 'video') : b, real && real.kind === 'image' ? m.name.replace(/\.[a-z0-9]+$/i, '') + (real.mime === 'image/png' ? '.png' : real.mime === 'image/gif' ? '.gif' : real.mime === 'image/webp' ? '.webp' : '.jpg') : m.name);
 }
 function saveBlob(blob, name) {
   const u = URL.createObjectURL(blob); const a = h('a', { href: u, download: name }); document.body.append(a); a.click(); a.remove();
@@ -106,8 +154,10 @@ function saveBlob(blob, name) {
 }
 async function shareMedia(id) {
   const m = await LCA.get('media', id); const b = await LCA.getFile(id); if (!m || !b) return toast('File not available');
-  const f = new File([b], m.name, { type: /^(video|audio)$/.test(m.kind) ? avBlob(b, m.name, m.kind === 'video').type : (m.mime || b.type) });
-  if (navigator.canShare && navigator.canShare({ files: [f] })) { try { await navigator.share({ files: [f] }); } catch (e) { } } else saveBlob(b, m.name);
+  const real = /^(video|audio)$/.test(m.kind) ? await sniffReal(b, id) : null;
+  const f = real && real.kind === 'image' ? new File([b], m.name.replace(/\.[a-z0-9]+$/i, '') + (real.mime === 'image/png' ? '.png' : '.jpg'), { type: real.mime })
+    : new File([b], m.name, { type: real ? avBlob(b, m.name, real.kind !== 'audio' && m.kind === 'video').type : (m.mime || b.type) });
+  if (navigator.canShare && navigator.canShare({ files: [f] })) { try { await navigator.share({ files: [f] }); } catch (e) { } } else saveBlob(f, f.name);
 }
 
 /* ---------- avatars (saved page pictures, cached on this device) ---------- */
@@ -143,7 +193,7 @@ async function cacheAvatars(urls, label, L) {
 /* ---------- import helper (worker) ----------
    The helper normally runs as a Web Worker. It must say "ready" (with the same version as this screen) within 15 s;
    otherwise it is stopped and the same code is loaded into the page instead, so imports still work – only slower. */
-const APP_VERSION = '9';
+const APP_VERSION = '10';
 let worker = null, workerDone = null, workerMode = null, workerStarting = null, workerJob = 0;
 async function onWorkerMessage(e) {
   const d = e.data; if (!d) return;
