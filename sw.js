@@ -1,6 +1,6 @@
 /* Offline app shell. Caches only the app's own code – never archive data (that lives in IndexedDB). */
-const VERSION = 'lca-v8'; // v8: Messenger secure-storage (encrypted chats) import, combined with the export's chats
-const SHELL = ['./', 'index.html', 'styles.css?v=8', 'app.js?v=8', 'shared.js?v=8', 'parsers.js?v=8', 'worker.js?v=8', 'vendor/zip.min.js?v=8', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png', 'icons/icon-maskable-512.png'];
+const VERSION = 'lca-v9'; // v9: video/audio playback (MIME type, retry, clear note for unplayable formats)
+const SHELL = ['./', 'index.html', 'styles.css?v=9', 'app.js?v=9', 'shared.js?v=9', 'parsers.js?v=9', 'worker.js?v=9', 'vendor/zip.min.js?v=9', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png', 'icons/icon-maskable-512.png'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(VERSION).then(c => c.addAll(SHELL.map(u => new Request(u, { cache: 'reload' })))).then(() => self.skipWaiting())); });
 self.addEventListener('activate', e => { e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== VERSION).map(k => caches.delete(k)))).then(() => self.clients.claim())); });
 self.addEventListener('fetch', e => {

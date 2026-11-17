@@ -143,3 +143,10 @@ progress{width:100%;height:12px}
 #progBar{width:100%}
 .errbanner.upd{background:#ede9fe;color:#3b0764;border-color:#c4b5fd}
 [hidden]{display:none!important}
+/* v9: video/audio that this browser cannot play */
+.avnote{font-size:13px;line-height:1.35;padding:8px 10px;border:1px dashed var(--warn);border-radius:10px;color:var(--warn);background:var(--warnbg);max-width:320px}
+.vwrap .avnote{margin:auto;max-width:90vw}
+.vwrap{display:flex;align-items:center;justify-content:center;flex-direction:column;gap:8px;width:100%;height:100%}
+.vwrap video{max-width:100%;max-height:100%}
+.vwrap .dl{color:#fff;font-size:15px;border:1px solid #fff8;border-radius:8px;padding:8px 14px}
+.avph{display:flex;align-items:center;justify-content:center;width:100%;height:100%;font-size:34px;background:var(--warnbg)}

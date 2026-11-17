@@ -52,12 +52,53 @@ async function loadMediaEl(el) {
   try {
     const b = await LCA.getFile(id);
     if (!b) { el.replaceWith(h('span', { class: 'filechip missing' }, '⚠️ File could not be loaded')); return; }
+    if (!el.isConnected) return; // page changed while the file was read
+    if (el.tagName === 'VIDEO' || el.tagName === 'AUDIO') return setAvSrc(el, b, id);
     el.src = track(URL.createObjectURL(b));
   } catch (e) { console.warn(e); }
 }
+/* v9 video/audio: always hand the player a Blob with the right MIME type (fixes files already stored with an
+   empty/generic type – no re-import needed). If the player still fails, retry once from an in-memory copy of the bytes
+   (some phones fail to stream a file straight out of the browser database); if that fails too the format itself is not
+   playable in this browser – say so, with the codec, and keep the Save button. */
+const AV_MIME = { mp4: 'video/mp4', m4v: 'video/mp4', mov: 'video/quicktime', webm: 'video/webm', '3gp': 'video/3gpp', mkv: 'video/x-matroska', ogg: 'audio/ogg', oga: 'audio/ogg', opus: 'audio/ogg', mp3: 'audio/mpeg', m4a: 'audio/mp4', aac: 'audio/aac', wav: 'audio/wav', amr: 'audio/amr', weba: 'audio/webm' };
+function avBlob(b, name, isVideo) {
+  let t = AV_MIME[LCA.ext(name)] || (b.type && b.type !== 'application/octet-stream' ? b.type : '') || (isVideo ? 'video/mp4' : 'audio/mpeg');
+  if (isVideo && t === 'audio/ogg') t = 'video/ogg';
+  return b.type === t ? b : b.slice(0, b.size, t);
+}
+async function sniffCodec(b) {
+  try {
+    const head = new Uint8Array(await b.slice(0, 4 << 20).arrayBuffer()), tail = b.size > 4 << 20 ? new Uint8Array(await b.slice(-(4 << 20)).arrayBuffer()) : new Uint8Array(0);
+    const has = (tag) => { const c = [...tag].map(x => x.charCodeAt(0)); for (const a of [head, tail]) for (let i = 0; i + 4 <= a.length; i++) if (a[i] === c[0] && a[i + 1] === c[1] && a[i + 2] === c[2] && a[i + 3] === c[3]) return true; return false; };
+    if (has('dvh1') || has('dvhe')) return 'Dolby Vision HDR (HEVC)'; if (has('hvc1') || has('hev1')) return 'HEVC / H.265';
+    if (has('av01')) return 'AV1'; if (has('vp09')) return 'VP9'; if (has('avc1') || has('avc3')) return 'H.264'; if (has('mp4v')) return 'MPEG-4 Part 2';
+    if (has('OggS')) return 'Ogg'; if (has('#!AMR')) return 'AMR';
+  } catch (e) { }
+  return '';
+}
+function setAvSrc(el, b, id) {
+  const name = LCA.baseName(id), isVideo = el.tagName === 'VIDEO';
+  let tries = 0;
+  const onErr = async () => {
+    if (!el.isConnected) return;
+    const code = el.error ? el.error.code : 0;
+    if (tries++ === 0) { // retry once from memory
+      try { const mem = new Blob([await b.arrayBuffer()], { type: avBlob(b, name, isVideo).type }); el.src = track(URL.createObjectURL(mem)); el.load(); return; } catch (e) { }
+    }
+    el.removeEventListener('error', onErr);
+    const codec = await sniffCodec(b);
+    console.warn('media not playable', name, 'error', code, codec);
+    const note = h('div', { class: 'avnote' }, `⚠️ This ${isVideo ? 'video' : 'audio clip'} can't be played in this browser${codec ? ` (format: ${codec})` : ''}. Tap “⤓ Save” to play it in your phone's ${isVideo ? 'video' : 'audio'} app.`);
+    if (el.closest('.tile')) el.replaceWith(h('div', { class: 'avph' }, isVideo ? '🎬' : '🎤')); else el.replaceWith(note);
+    if (!note.parentElement?.querySelector('.dl') && note.isConnected) note.after(h('button', { class: 'dl', onclick: () => downloadMedia(id) }, '⤓ Save'));
+  };
+  el.addEventListener('error', onErr);
+  el.src = track(URL.createObjectURL(avBlob(b, name, isVideo)));
+}
 async function downloadMedia(id) {
   const m = await LCA.get('media', id); const b = await LCA.getFile(id); if (!m || !b) return toast('File not available');
-  saveBlob(b, m.name);
+  saveBlob(/^(video|audio)$/.test(m.kind) ? avBlob(b, m.name, m.kind === 'video') : b, m.name);
 }
 function saveBlob(blob, name) {
   const u = URL.createObjectURL(blob); const a = h('a', { href: u, download: name }); document.body.append(a); a.click(); a.remove();
@@ -65,7 +106,7 @@ function saveBlob(blob, name) {
 }
 async function shareMedia(id) {
   const m = await LCA.get('media', id); const b = await LCA.getFile(id); if (!m || !b) return toast('File not available');
-  const f = new File([b], m.name, { type: m.mime });
+  const f = new File([b], m.name, { type: /^(video|audio)$/.test(m.kind) ? avBlob(b, m.name, m.kind === 'video').type : (m.mime || b.type) });
   if (navigator.canShare && navigator.canShare({ files: [f] })) { try { await navigator.share({ files: [f] }); } catch (e) { } } else saveBlob(b, m.name);
 }
 
@@ -102,7 +143,7 @@ async function cacheAvatars(urls, label, L) {
 /* ---------- import helper (worker) ----------
    The helper normally runs as a Web Worker. It must say "ready" (with the same version as this screen) within 15 s;
    otherwise it is stopped and the same code is loaded into the page instead, so imports still work – only slower. */
-const APP_VERSION = '8';
+const APP_VERSION = '9';
 let worker = null, workerDone = null, workerMode = null, workerStarting = null, workerJob = 0;
 async function onWorkerMessage(e) {
   const d = e.data; if (!d) return;
@@ -601,13 +642,17 @@ async function openViewerForThread(threadId, mediaId) {
 }
 function openViewer(list, i) { V = { list, i, url: null }; $('#viewer').hidden = false; document.body.style.overflow = 'hidden'; drawViewer(); }
 function closeViewer() { const v = $('#viewer'); v.hidden = true; v.innerHTML = ''; document.body.style.overflow = ''; if (V.url) URL.revokeObjectURL(V.url); V.url = null; }
+function viewerVideo(b, id) { // own URL list so closing the viewer can't revoke a thread's players and vice versa
+  const el = h('video', { controls: true, autoplay: true, playsinline: true, 'data-media': id });
+  const wrap = h('div', { class: 'vwrap' }, el); setAvSrc(el, b, id); return wrap;
+}
 async function drawViewer() {
   const v = $('#viewer'); const it = V.list[V.i]; if (!it) return closeViewer();
-  const b = await LCA.getFile(it.id); if (V.url) URL.revokeObjectURL(V.url); V.url = b ? URL.createObjectURL(b) : null;
+  const b = await LCA.getFile(it.id); if (V.url) URL.revokeObjectURL(V.url); V.url = b && it.kind !== 'video' ? URL.createObjectURL(b) : null;
   const t = S.threadMap.get(it.threadId);
   const ord = it.msgId ? +(it.msgId.split('#').pop()) : null;
   v.innerHTML = '';
-  const stage = h('div', { class: 'stage' }, it.kind === 'video' ? h('video', { src: V.url, controls: true, autoplay: true, playsinline: true }) : h('img', { src: V.url, alt: it.name }),
+  const stage = h('div', { class: 'stage' }, it.kind === 'video' ? (b ? viewerVideo(b, it.id) : h('div', { class: 'avnote' }, '⚠️ File could not be loaded')) : h('img', { src: V.url, alt: it.name }),
     V.i > 0 ? h('button', { class: 'nav l', 'aria-label': 'Previous', onclick: () => { V.i--; drawViewer(); } }, '‹') : null,
     V.i < V.list.length - 1 ? h('button', { class: 'nav r', 'aria-label': 'Next', onclick: () => { V.i++; drawViewer(); } }, '›') : null);
   let sx = null; stage.addEventListener('touchstart', e => sx = e.touches[0].clientX, { passive: true });
