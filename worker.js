@@ -3,22 +3,25 @@
    and runs it there instead (slower, but it works) – see LCAInlineWorker at the end. */
 'use strict';
 (function () {
-const VERSION = '6';
+const VERSION = '7';
 const IN_WORKER = typeof WorkerGlobalScope !== 'undefined' && self instanceof WorkerGlobalScope;
-if (IN_WORKER) importScripts('vendor/zip.min.js?v=6', 'shared.js?v=6');
+if (IN_WORKER) importScripts('vendor/zip.min.js?v=7', 'shared.js?v=7');
 zip.configure({ useWebWorkers: false });
 // in the page, use a separate handle so the helper never changes which profile the screen shows
 const LCA = IN_WORKER ? self.LCA : self.LCA.fork();
-let send = IN_WORKER ? (m) => self.postMessage(m) : () => {};
+let post = IN_WORKER ? (m) => self.postMessage(m) : () => {};
+let curJob = null, dead = false; // dead: the page helper was stopped – the running job ends at its next step
+const send = (m) => post(curJob != null && m.job == null ? Object.assign({ job: curJob }, m) : m);
 
 const pending = new Map(); let seq = 0;
 function askMain(type, payload) { return new Promise(res => { const id = ++seq; pending.set(id, res); send(Object.assign({ type, id }, payload)); }); }
-const progress = (phase, done, total, note) => send({ type: 'progress', phase, done, total, note });
+const progress = (phase, done, total, note, bytes) => { if (dead) throw new Error('Stopped by you.'); send({ type: 'progress', phase, done, total, note, bytes: !!bytes }); };
 const log = (msg) => send({ type: 'log', msg });
 
 async function handle(e) {
   const d = e.data;
   if (d.type === 'reply') { const r = pending.get(d.id); pending.delete(d.id); if (r) r(d.result); return; }
+  curJob = d.job != null ? d.job : null;
   try {
     // every job names the profile database it works on, so data can never land in another profile.
     // A screen from an older version of the app (before profiles) sends no profile: ask for a reload instead of guessing.
@@ -494,11 +497,16 @@ async function backupProfile(w, dir, label) {
   return stores;
 }
 /* What is inside a backup file (old single-profile backups have version 1 and no profile name). */
-async function inspectBackup(file) {
-  const r = new zip.ZipReader(new zip.BlobReader(file)); const es = await r.getEntries();
+async function openBackup(file, phase) {
+  const r = new zip.ZipReader(new zip.BlobReader(file));
+  const es = await r.getEntries({ onprogress: (i, n) => { if (i % 200 === 0 || i === n) progress(phase, i, n, 'Reading the list of files inside the backup'); } });
   const by = new Map(es.map(e => [e.filename, e]));
-  const man = by.get('lizcoobys-backup.json'); if (!man) throw new Error('This is not a Liz Coobys Archive backup file.');
+  const man = by.get('lizcoobys-backup.json'); if (!man) { await r.close().catch(() => {}); throw new Error('This is not a Liz Coobys Archive backup file.'); }
   const manifest = JSON.parse(await man.getData(new zip.TextWriter()));
+  return { r, es, by, manifest };
+}
+async function inspectBackup(file) {
+  const { r, by, manifest } = await openBackup(file, 'Reading backup');
   const readMeta = async (dir) => { const e = by.get(dir + 'stores/meta.json'); if (!e) return {}; try { const rows = JSON.parse(await e.getData(new zip.TextWriter())); const o = {}; for (const x of rows) if (x && (x.key === 'ownerFromProfile' || x.key === 'owner' || x.key === 'profileName')) o[x.key] = x.value; return o; } catch (err) { return {}; } };
   const out = [];
   if (manifest.kind === 'all-profiles' && Array.isArray(manifest.profiles)) {
@@ -509,26 +517,32 @@ async function inspectBackup(file) {
   await r.close();
   return { version: manifest.version || 1, kind: manifest.kind || 'profile', createdAt: manifest.createdAt || null, profiles: out };
 }
+/* Restore one profile, entry by entry (each file is read from the backup only when it is written – never the whole
+   backup at once). Progress = files and MB written. */
 async function restoreBackup(file, prefix) {
-  const r = new zip.ZipReader(new zip.BlobReader(file)); const es = await r.getEntries();
-  const by = new Map(es.map(e => [e.filename, e]));
-  const man = by.get('lizcoobys-backup.json'); if (!man) throw new Error('This is not a Liz Coobys Archive backup file.');
-  const manifest = JSON.parse(await man.getData(new zip.TextWriter()));
+  const phase = 'Restoring backup';
+  const { r, es, by, manifest } = await openBackup(file, phase);
   if (!by.has(prefix + 'stores/threads.json') && !by.has(prefix + 'stores/meta.json')) throw new Error('This profile was not found in the backup file.');
+  const mine = es.filter(e => !e.directory && e.filename !== 'lizcoobys-backup.json' && e.filename.startsWith(prefix) && !e.filename.slice(prefix.length).startsWith('profiles/'));
+  const totalBytes = mine.reduce((a, e) => a + (e.uncompressedSize || 0), 0) || 1, nFiles = mine.length;
+  let doneBytes = 0, doneFiles = 0;
+  const step = (e, what) => { doneBytes += e ? (e.uncompressedSize || 0) : 0; doneFiles += e ? 1 : 0; progress(phase, doneBytes, totalBytes, `${what} · ${doneFiles} of ${nFiles} files · ${fmtSize(doneBytes)} of ${fmtSize(totalBytes)}`, true); };
+  const json = async (e) => JSON.parse(await e.getData(new zip.TextWriter()));
   await LCA.clear(LCA.STORES);
-  for (const s of ['threads', 'search', 'friends', 'groups', 'pages', 'meta']) { const e = by.get(`${prefix}stores/${s}.json`); if (e) await LCA.putMany(s, JSON.parse(await e.getData(new zip.TextWriter()))); progress('Restoring ' + s, 0, 1); }
+  for (const s of ['threads', 'search', 'friends', 'groups', 'pages', 'meta']) { const e = by.get(`${prefix}stores/${s}.json`); if (e) { await LCA.putMany(s, await json(e)); step(e, 'Restoring ' + s); } }
   const re = new RegExp('^' + prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + 'stores/messages-\\d+\\.json$');
   const parts = es.filter(e => re.test(e.filename)).sort((a, b) => a.filename < b.filename ? -1 : 1);
-  for (let k = 0; k < parts.length; k++) { const rows = JSON.parse(await parts[k].getData(new zip.TextWriter())); for (let q = 0; q < rows.length; q += 2000) await LCA.putMany('messages', rows.slice(q, q + 2000)); progress('Restoring messages', k + 1, parts.length); }
+  for (const pe of parts) { const rows = await json(pe); for (let q = 0; q < rows.length; q += 2000) await LCA.putMany('messages', rows.slice(q, q + 2000)); step(pe, 'Restoring messages'); }
   for (const [s, f] of [['media', 'stores/media.json'], ['avatars', 'stores/avatars.json']]) {
-    const e = by.get(prefix + f); if (!e) continue; const meta = JSON.parse(await e.getData(new zip.TextWriter())); let batch = [];
+    const e = by.get(prefix + f); if (!e) continue; const meta = await json(e); step(e, 'Restoring ' + s); let batch = [];
+    const flush = async () => { if (!batch.length) return; if (s === 'media') { await saveMedia(batch.filter(x => x.blob)); await LCA.putMany('media', batch.filter(x => !x.blob)); } else await LCA.putMany(s, batch); batch = []; };
     for (let k = 0; k < meta.length; k++) {
       const m = meta[k]; const fe = m.file ? (by.get(m.file) || by.get(prefix + m.file)) : null; delete m.file;
       if (fe) m.blob = await fe.getData(new zip.BlobWriter(m.mime || 'application/octet-stream'));
-      batch.push(m); if (batch.length >= 25) { await (s === 'media' ? saveMedia(batch.filter(x => x.blob)).then(() => LCA.putMany('media', batch.filter(x => !x.blob))) : LCA.putMany(s, batch)); batch = []; }
-      if (k % 20 === 0) progress('Restoring ' + s, k, meta.length);
+      batch.push(m); if (batch.length >= 25) await flush();
+      if (fe) step(fe, s === 'media' ? 'Restoring photos & videos' : 'Restoring pictures'); else if (k % 50 === 0) step(null, 'Restoring ' + s);
     }
-    if (batch.length) await (s === 'media' ? saveMedia(batch.filter(x => x.blob)).then(() => LCA.putMany('media', batch.filter(x => !x.blob))) : LCA.putMany(s, batch));
+    await flush();
   }
   await r.close();
   progress('Finished', 1, 1);
@@ -538,11 +552,13 @@ async function restoreBackup(file, prefix) {
 if (IN_WORKER) { self.onmessage = handle; send({ type: 'ready', version: VERSION }); }
 else {
   // page fallback: an object that behaves like a Worker
+  let chain = Promise.resolve();
   self.LCAInlineWorker = {
     version: VERSION,
     create(onmessage) {
-      send = (m) => setTimeout(() => onmessage({ data: m }), 0);
-      return { inline: true, postMessage: (m) => setTimeout(() => handle({ data: m }), 0), terminate() { send = () => {}; } };
+      post = (m) => setTimeout(() => onmessage({ data: m }), 0);
+      // jobs run one after another; a stopped job ends at its next step before the next one starts
+      return { inline: true, postMessage: (m) => { if (m && m.type === 'reply') return setTimeout(() => handle({ data: m }), 0); chain = chain.then(() => { dead = false; return handle({ data: m }); }); }, terminate() { dead = true; post = () => {}; if (LCA.kill) LCA.kill(); } };
     }
   };
 }

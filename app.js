@@ -100,12 +100,13 @@ async function cacheAvatars(urls, label, L) {
 /* ---------- import helper (worker) ----------
    The helper normally runs as a Web Worker. It must say "ready" (with the same version as this screen) within 15 s;
    otherwise it is stopped and the same code is loaded into the page instead, so imports still work – only slower. */
-const APP_VERSION = '6';
-let worker = null, workerDone = null, workerMode = null, workerStarting = null;
+const APP_VERSION = '7';
+let worker = null, workerDone = null, workerMode = null, workerStarting = null, workerJob = 0;
 async function onWorkerMessage(e) {
   const d = e.data; if (!d) return;
+  if (d.job != null && d.job !== workerJob) return; // from a job that was stopped
   S.lastBeat = Date.now();
-  if (d.type === 'progress') setProgress(d.phase, d.done, d.total, d.note);
+  if (d.type === 'progress') setProgress(d.phase, d.done, d.total, d.note, d.bytes);
   else if (d.type === 'parseMessageHtml') worker.postMessage({ type: 'reply', id: d.id, result: safe(() => Parsers.parseMessageHtml(d.text)) });
   else if (d.type === 'parseHtmlList') worker.postMessage({ type: 'reply', id: d.id, result: safe(() => Parsers.parseHtmlList(d.text)) });
   else if (d.type === 'confirmProfile') worker.postMessage({ type: 'reply', id: d.id, result: await confirmProfileName(d.name).catch(() => true) });
@@ -145,7 +146,7 @@ async function getWorker() {
       console.warn('worker failed, using in-page helper', err);
       setProgress('Starting the import helper', 0, 1, `Note: ${err.message}. Importing inside the page instead – this works, but the screen may react slowly while it runs.`);
       await loadInlineHelper();
-      if (self.LCAInlineWorker.version !== APP_VERSION) throw new Error('This screen and the app files do not match (an update is half-loaded). Please reload the page and try again.');
+      if (self.LCAInlineWorker.version !== APP_VERSION) { S.updateWaiting = true; updateBanner(); throw new Error('The app has just been updated. Tap “Reload” at the top of the screen (or close the app completely and open it again), then try again.'); }
       worker = self.LCAInlineWorker.create(onWorkerMessage); workerMode = 'inline';
     }
     return worker;
@@ -155,21 +156,43 @@ async function getWorker() {
 function stopWorker() { if (worker) { try { worker.terminate(); } catch (e) { } worker = null; } }
 function safe(f) { try { return f(); } catch (e) { console.error(e); return null; } }
 async function runWorker(msg) {
-  const w = await getWorker();
-  return new Promise((resolve, reject) => { workerDone = { resolve, reject }; S.lastBeat = Date.now(); w.postMessage(msg); });
+  const w = await guard(getWorker()); checkStop();
+  const id = ++workerJob;
+  return guard(new Promise((resolve, reject) => { workerDone = { resolve, reject }; S.lastBeat = Date.now(); w.postMessage(Object.assign({ job: id }, msg)); }));
 }
+/* ---------- jobs (import / restore / backup) ----------
+   Only one runs at a time. Stop works in every phase: it aborts the job, stops the helper, and frees the screen at once –
+   even if the phone never answers a pending file read. */
+let jobSeq = 0;
+const stoppedError = () => Object.assign(new Error('Stopped by you.'), { stopped: true });
+function beginJob(kind) {
+  const job = { id: ++jobSeq, kind, ac: new AbortController() };
+  job.stopP = new Promise((_, rej) => job.ac.signal.addEventListener('abort', () => rej(stoppedError()), { once: true })); job.stopP.catch(() => {});
+  S.job = job; S.busy = true; S.busySince = Date.now(); S.lastBeat = Date.now(); S.lastError = null; drawError();
+  $('#statusBtn')?.classList.add('attn'); drawProfileBtn(); showProgBox();
+  return job;
+}
+function endJob(job) {
+  if (S.job !== job) return false;
+  S.job = null; S.busy = false; $('#statusBtn')?.classList.remove('attn'); drawProfileBtn(); drawProgress();
+  if (S.updateWaiting) updateBanner();
+  return true;
+}
+const isStopped = (job) => !!(job && job.ac.signal.aborted);
+function checkStop() { if (S.job && S.job.ac.signal.aborted) throw stoppedError(); }
+const guard = (p) => S.job ? Promise.race([p, S.job.stopP]) : p;
 
 /* ---------- progress UI ----------
    The last status is remembered, so it is shown again when the Import page is redrawn, and a ticker shows
    that the app is still alive (and for how long nothing new happened) while something runs. */
-function setProgress(phase, done, total, note) {
-  S.lastProg = { phase, done, total, note, at: Date.now() };
+function setProgress(phase, done, total, note, bytes) {
+  S.lastProg = { phase, done, total, note, bytes: !!bytes, at: Date.now() };
   drawProgress();
 }
 function drawProgress() {
   const p = $('#prog'), lp = S.lastProg; if (!p || !lp) return;
   showProgBox();
-  $('#progPhase').textContent = lp.phase + (lp.total > 1 ? ` (${fmtN(lp.done)} of ${fmtN(lp.total)})` : '');
+  $('#progPhase').textContent = lp.phase + (lp.total > 1 && !lp.bytes ? ` (${fmtN(lp.done)} of ${fmtN(lp.total)})` : '');
   const bar = $('#progBar');
   if (S.busy && !(lp.total > 1)) bar.removeAttribute('value'); else { bar.max = lp.total || 1; bar.value = lp.done || 0; }
   $('#progNote').textContent = lp.note || '';
@@ -190,11 +213,18 @@ function drawError() {
   e.hidden = !x; e.innerHTML = ''; if (x) showProgBox(); else { const c = $('#progCard'); if (c && !S.busy && !S.lastProg) c.hidden = true; }
   if (x) e.append(h('b', null, '❌ ' + x.title), h('div', null, x.msg), h('button', { class: 'btn', style: 'margin-top:6px', onclick: () => { S.lastError = null; drawError(); } }, 'OK'));
 }
-async function stopImport() {
-  if (!S.busy) return;
-  if (!confirm('Stop what is running now? Whatever was already saved stays; you can import the same files again later.')) return;
-  stopWorker(); S.stopped = true;
-  workerDone && workerDone.reject(new Error('Stopped by you.'));
+function stopImport() {
+  const job = S.job; if (!job) return;
+  job.ac.abort(); stopWorker();
+  if (workerDone) { workerDone.reject(stoppedError()); workerDone = null; }
+  const what = job.kind === 'restore' ? 'Restore stopped – nothing on this device was replaced.' : job.kind === 'backup' ? 'Backup stopped – no file was saved.' : 'Import stopped. What was already saved stays; you can import the same files again.';
+  endJob(job); setProgress('Stopped', 0, 1, what); toast('Stopped');
+}
+function updateBanner() {
+  if ($('#updBanner')) return;
+  const b = h('div', { id: 'updBanner', class: 'errbanner upd', role: 'status' }, h('div', { class: 'grow' }, '✨ A new version of the app is ready.'),
+    h('button', { class: 'btn primary', onclick: () => { if (S.busy) return toast('Please wait until the import / backup has finished (or tap Stop)'); location.reload(); } }, 'Reload'), h('button', { class: 'btn', 'aria-label': 'Close', onclick: () => b.remove() }, '✕'));
+  document.body.append(b);
 }
 /* Anything that goes wrong anywhere must be visible – never fail silently. */
 function errorBanner(msg) {
@@ -221,16 +251,16 @@ async function checkSpace(bytes) {
 
 /* ---------- import ---------- */
 async function importFiles(fileList) {
-  if (S.busy) return toast('An import is already running');
+  if (S.busy) return toast('Please wait – something is still running (or tap Stop)');
   const files = [...fileList]; if (!files.length) return;
   // everything below writes only into the profile that was selected when the import started (switching is locked meanwhile)
   const P = S.profile, L = LCA.at(P.db);
-  S.busy = true; S.busySince = Date.now(); S.stopped = false; S.lastError = null; drawError(); $('#statusBtn')?.classList.add('attn'); drawProfileBtn();
+  const job = beginJob('import');
   setProgress('Starting import', 0, 1, `${files.length} file(s) selected: ` + files.map(f => `${f.name} (${fmtBytes(f.size)})`).join(', '));
   const log = []; let backupFile = null, foundName = null, failed = false;
   try {
     // never wait forever for the browser's storage answers
-    await Promise.race([askPersist(), new Promise(r => setTimeout(r, 3000))]);
+    await guard(Promise.race([askPersist(), new Promise(r => setTimeout(r, 3000))]));
     const isAsset = (f) => /_files\//.test(f.webkitRelativePath || '');
     // decide by the file's content, not by its name or type (Android pickers often give no type or a generic one)
     const kinds = new Map();
@@ -239,28 +269,29 @@ async function importFiles(fileList) {
     const htmls = files.filter(f => kinds.get(f) === 'html' && !isAsset(f));
     const others = files.filter(f => !zips.includes(f) && !htmls.includes(f));
     for (const f of others) if (kinds.get(f) === 'empty') log.push(`⚠️ ${f.name} is empty (0 bytes) – nothing to import. Download it again.`);
-    if (!(await Promise.race([checkSpace(zips.reduce((a, f) => a + f.size, 0)), new Promise(r => setTimeout(() => r(true), 5000))]))) throw new Error('Import cancelled');
+    if (!(await guard(Promise.race([checkSpace(zips.reduce((a, f) => a + f.size, 0)), new Promise(r => setTimeout(() => r(true), 5000))])))) throw new Error('Import cancelled');
     if (zips.length) {
       // make sure every ZIP can actually be read quickly; slow phone/Drive files are copied into the app first
       const ready = [];
       for (let k = 0; k < zips.length; k++) ready.push(await readableZip(zips[k], k + 1, zips.length));
       setProgress('Starting the import helper', 0, 1);
       const r = await runWorker({ type: 'importZips', files: ready, db: P.db });
-      if (r && r.backup) { backupFile = zips[0]; log.push('That file is a Liz Coobys Archive backup – see the restore options.'); }
+      if (r && r.backup) { backupFile = ready[0]; log.push('That file is a Liz Coobys Archive backup – see the restore options.'); }
       else if (r && r.cancelled) log.push(`Import stopped before anything was saved (export belongs to “${r.profileName}”).`);
       else if (r && r.ok === false) { failed = true; throw new Error((r.openErrors || []).join('\n') || 'No files could be read from the ZIP.'); }
       else { log.push(`Facebook export imported into “${P.name}”: ${zips.map(z => z.name).join(', ')}`); foundName = r && r.profileName; }
       if (r && r.openErrors && r.openErrors.length && r.ok) { log.push('⚠️ ' + r.openErrors.join(' · ')); showError('Some files could not be opened', r.openErrors.join('\n')); }
     }
     for (const f of htmls) {
-      setProgress('Reading ' + f.name, 0, 1);
-      const txt = await f.text();
+      checkStop(); setProgress('Reading ' + f.name, 0, 1, fmtBytes(f.size));
+      const txt = await withTicker(f.text(), 'Reading ' + f.name, (s) => `${fmtBytes(f.size)} – waiting for the phone… ${fmtDur(s)}. ` + (s >= 8 ? driveHint : ''));
+      checkStop();
       const res = Parsers.parseSaved(txt, f.name);
       if (!res.kind) { await noteIgnored(L, [{ path: f.name, size: f.size, reason: 'HTML file not recognised as a saved friends / groups / pages page' }]); log.push(`${f.name}: not recognised`); continue; }
       const n = await storeSaved(L, res, f.name);
       log.push(`${f.name}: ${n} ${res.kind} read`);
       setProgress('Saving pictures', 0, 1);
-      const av = await cacheAvatars(res.items.map(i => i.image), res.kind, L);
+      const av = await guard(cacheAvatars(res.items.map(i => i.image), res.kind, L));
       const rep = await L.getMeta('report', null) || {}; rep.saved = rep.saved || {}; rep.saved[res.kind].avatars = av; await L.setMeta('report', rep);
       log.push(`${av.ok} of ${av.total} pictures saved offline` + (av.fail ? ` (${av.fail} could not be downloaded – these show initials)` : ''));
     }
@@ -268,30 +299,35 @@ async function importFiles(fileList) {
       await noteIgnored(L, others.map(f => ({ path: f.webkitRelativePath || f.name, size: f.size, reason: isAsset(f) || /\.(js|css|download)$/i.test(f.name) ? 'saved-web-page asset (scripts/styles – no archive data)' : 'unsupported file type' })));
       log.push(`${others.length} other file(s) listed in the report (no archive data in them)`);
     }
-    S.xcache.clear(); await loadState(true);
+    checkStop(); S.xcache.clear(); await loadState(true);
     if (!zips.length && !htmls.length) { failed = true; throw new Error('None of the selected files is a Facebook export (.zip) or a saved friends / Groups / pages page (.html).' + (log.length ? '\n' + log.join('\n') : '')); }
     setProgress('Done', 1, 1, log.join(' · '));
     toast(backupFile ? 'Backup file found' : 'Import finished');
     if (foundName && normName(foundName) !== normName(P.name)) toast(`This export belongs to “${foundName}” – you can rename the profile below`, 5000);
   } catch (e) {
-    console.error(e); failed = true;
-    const msg = (e && e.message || String(e)) + (/quota|space|full/i.test(e && e.message || '') ? '\n\nThe device seems to be out of storage space.' : '');
-    setProgress('Import stopped', 0, 1, msg); showError(S.stopped ? 'Import stopped' : 'Import problem', msg);
-    if (!S.stopped) alert('Import problem: ' + msg);
+    failed = true;
+    if (isStopped(job)) backupFile = null; // Stop already reset the screen
+    else {
+      console.error(e);
+      const msg = (e && e.message || String(e)) + (/quota|space|full/i.test(e && e.message || '') ? '\n\nThe device seems to be out of storage space.' : '');
+      setProgress('Import stopped', 0, 1, msg); showError('Import problem', msg);
+      alert('Import problem: ' + msg);
+    }
   } finally {
-    S.busy = false; S.stopped = false; $('#statusBtn')?.classList.remove('attn'); drawProfileBtn();
-    if (S.updateWaiting) toast('A new version of the app is ready – reload the page when convenient', 8000);
-    try { await loadState(true); } catch (e) { console.error(e); }
-    if (location.hash.startsWith('#/import')) { await render(); drawProgress(); drawError(); }
-    else toast(failed ? 'Import problem – see Import & status' : 'Import finished', 5000);
+    const mine = endJob(job);
+    try { S.xcache.clear(); await loadState(true); } catch (e) { console.error(e); }
+    if (mine || isStopped(job)) {
+      if (location.hash.startsWith('#/import')) await render();
+      else toast(isStopped(job) ? 'Import stopped' : failed ? 'Import problem – see Import & status' : 'Import finished', 5000);
+    }
   }
   if (backupFile) await restoreFlow(backupFile);
 }
 /* What is this file? Looks at the first bytes. Shows a ticking status while the phone hands the file over. */
 async function withTicker(promise, phase, note) {
   const t0 = Date.now(); let n = 0;
-  const iv = setInterval(() => { n = (Date.now() - t0) / 1000; setProgress(phase, 0, 1, note(n)); }, 1000);
-  try { return await promise; } finally { clearInterval(iv); }
+  const iv = setInterval(() => { n = (Date.now() - t0) / 1000; if (S.busy) setProgress(phase, 0, 1, note(n)); }, 1000);
+  try { return await guard(promise); } finally { clearInterval(iv); }
 }
 const driveHint = 'If the file is in Google Drive, the phone may be downloading it first – that can take several minutes for a big file. If nothing changes, download it to the phone (Drive → ⋮ → Download) and choose it from “Downloads”.';
 async function readSlice(f, a, b) {
@@ -311,24 +347,45 @@ async function sniffFile(f, k, n) {
    picked straight from Google Drive) deliver the bytes only slowly or in order; reading such a file at random places can
    look like a freeze. So: test-read the end and the middle; if that is not fast, copy the file into the app once,
    in pieces, with a visible MB counter, and import from the copy. */
-async function readableZip(f, k, n) {
-  const label = n > 1 ? `Opening file ${k} of ${n}: ${f.name}` : `Opening ${f.name}`;
+async function readableZip(f, k, n, verb) {
+  if (f.lcaReady) return f;
+  const label = verb ? verb : n > 1 ? `Opening file ${k} of ${n}: ${f.name}` : `Opening ${f.name}`;
+  checkStop();
   const probe = (async () => { const t = Date.now(); await readSlice(f, Math.max(0, f.size - 65536), f.size); await readSlice(f, Math.floor(f.size / 2), Math.floor(f.size / 2) + 65536); return Date.now() - t; })();
   probe.catch(() => {});
   const fast = await withTicker(Promise.race([probe, new Promise(r => setTimeout(() => r(null), 4000))]), label, (s) => `Checking that the file can be read… ${fmtDur(s)}`);
-  if (fast != null && fast < 2500) return f;
-  setProgress(label, 0, f.size, 'This file is delivered slowly by the phone, so it is copied into the app first.');
-  const CH = 4 * 1048576, parts = []; let pos = 0; const t0 = Date.now();
-  while (pos < f.size) {
-    if (S.stopped) throw new Error('Stopped by you.');
-    const end = Math.min(f.size, pos + CH);
-    parts.push(await withTicker(readSlice(f, pos, end), label, () => `Copying the file into the app: ${fmtBytes(pos)} of ${fmtBytes(f.size)} – waiting for the phone… ${driveHint}`));
-    pos = end;
-    const secs = (Date.now() - t0) / 1000, rate = pos / Math.max(secs, 0.1);
-    setProgress(label, pos, f.size, `Copying the file into the app: ${fmtBytes(pos)} of ${fmtBytes(f.size)}` + (secs > 3 ? ` · about ${fmtDur((f.size - pos) / rate)} left` : ''));
-  }
+  if (fast != null && fast < 1500) { f.lcaReady = true; return f; }
+  const copy = await copyFile(f, label); copy.lcaReady = true; return copy;
+}
+/* Copy a slowly delivered file into the app by reading it once from start to end (what phone storage and Drive
+   handle best). Shows MB of MB, notices stalls, and stops at once when Stop is tapped. */
+async function copyFile(f, label) {
+  const job = S.job, t0 = Date.now(), CH = 4 * 1048576;
+  let pos = 0, lastAt = Date.now(), shownAt = 0; const parts = []; let buf = [], bufLen = 0;
+  const msg = (extra) => `Copying the file into the app first (the phone delivers it slowly): ${fmtBytes(pos)} of ${fmtBytes(f.size)}` + (extra || '');
+  setProgress(label, 0, f.size, msg(), true);
+  const rd = f.stream().getReader();
+  const onAbort = () => { rd.cancel().catch(() => {}); };
+  job && job.ac.signal.addEventListener('abort', onAbort, { once: true });
+  const iv = setInterval(() => { const q = (Date.now() - lastAt) / 1000; if (q >= 3 && S.job === job) setProgress(label, pos, f.size, msg(` – waiting for the phone… ${fmtDur(q)}. ` + (q >= 8 ? driveHint : '')), true); }, 1000);
+  try {
+    for (;;) {
+      checkStop();
+      const { done, value } = await guard(rd.read());
+      if (done) break;
+      lastAt = Date.now(); buf.push(value); bufLen += value.length; pos += value.length;
+      if (bufLen >= CH) { parts.push(new Blob(buf)); buf = []; bufLen = 0; }
+      if (Date.now() - shownAt > 300) { shownAt = Date.now(); const secs = (Date.now() - t0) / 1000, rate = pos / Math.max(secs, 0.1); setProgress(label, pos, f.size, msg(secs > 3 ? ` · about ${fmtDur((f.size - pos) / rate)} left` : ''), true); }
+    }
+    if (buf.length) parts.push(new Blob(buf));
+  } catch (e) {
+    if (isStopped(job) || e.stopped) throw stoppedError();
+    throw new Error(`The phone could not read “${f.name}” (${e.name || 'error'}: ${e.message}). ${driveHint}`);
+  } finally { clearInterval(iv); job && job.ac.signal.removeEventListener('abort', onAbort); }
+  if (pos !== f.size) throw new Error(`Only ${fmtBytes(pos)} of ${fmtBytes(f.size)} of “${f.name}” could be read. ${driveHint}`);
+  setProgress(label, pos, f.size, msg(' – done'), true);
   try { return new File(parts, f.name, { type: 'application/zip' }); }
-  catch (e) { return new Blob(parts, { type: 'application/zip' }); }
+  catch (e) { const b = new Blob(parts, { type: 'application/zip' }); b.name = f.name; return b; }
 }
 async function noteIgnored(L, list) {
   const rep = await L.getMeta('report', null) || {}; rep.ignoredUploads = (rep.ignoredUploads || []).concat(list).slice(-5000);
@@ -347,9 +404,16 @@ async function storeSaved(L, res, fileName) {
 }
 
 /* ---------- router ---------- */
-window.addEventListener('hashchange', render);
+/* Android's Back button changes the page: never leave a photo viewer or a menu open on top of the new page. */
+window.addEventListener('hashchange', () => { if (!$('#viewer').hidden) closeViewer(); for (const c of [...openSheets]) c(); render(); });
 $('#searchForm').addEventListener('submit', (e) => { e.preventDefault(); const q = $('#q').value.trim(); if (q) location.hash = '#/search/' + encodeURIComponent(q); $('#q').blur(); });
-async function render() {
+let renderRun = null, renderAgain = false;
+function render() {
+  if (renderRun) { renderAgain = true; return renderRun; }
+  renderRun = (async () => { try { do { renderAgain = false; await renderNow(); } while (renderAgain); } finally { renderRun = null; } })();
+  return renderRun;
+}
+async function renderNow() {
   if (!S.profile) return; // still starting up
   revokeAll();
   const parts = (location.hash || '#/messenger').slice(2).split('/');
@@ -909,15 +973,18 @@ async function ownerCard() {
   return h('div', { class: 'card' }, h('h3', { style: 'margin-top:0' }, '🙋 Which name is you?'), h('div', { class: 'small mut' }, 'Your own messages are shown on the right in blue.'), sel);
 }
 async function doBackup(all) {
-  if (S.busy) return toast('Please wait – something is still running'); S.busy = true; drawProfileBtn(); showProgBox();
+  if (S.busy) return toast('Please wait – something is still running (or tap Stop)');
+  const job = beginJob('backup'); setProgress('Starting backup', 0, 1);
   const list = (all ? S.profiles : [S.profile]).map(p => ({ id: p.id, name: p.name, icon: p.icon || null, db: p.db }));
   try {
     const r = await runWorker({ type: 'backup', profiles: list, all: !!all }); const d = new Date().toISOString().slice(0, 10);
     saveBlob(r.blob, all ? `liz-coobys-archive-backup-all-profiles-${d}.zip` : `liz-coobys-archive-backup-${fileSafe(list[0].name)}-${d}.zip`);
     for (const p of list) await LCA.at(p.db).setMeta('lastBackup', Date.now());
-    setProgress('Backup ready – ' + fmtBytes(r.blob.size) + (all ? ` (${list.length} profiles)` : ` (${list[0].name})`), 1, 1);
+    setProgress('Backup ready – ' + fmtBytes(r.blob.size) + (all ? ` (${list.length} profiles)` : ` (${list[0].name})`), 1, 1, 'Saved to your Downloads folder.');
+    toast('Backup saved to Downloads');
   }
-  catch (e) { alert('Backup failed: ' + e.message); } finally { S.busy = false; drawProfileBtn(); }
+  catch (e) { if (!isStopped(job)) { console.error(e); setProgress('Backup failed', 0, 1, e.message); showError('Backup failed', e.message); alert('Backup failed: ' + e.message); } }
+  finally { stopWorker(); endJob(job); }
 }
 const fileSafe = (n) => (n || 'profile').replace(/[\\/:*?"<>|\s]+/g, '-').slice(0, 40);
 async function eraseAll() {
@@ -1012,6 +1079,19 @@ const PR = (() => {
 })();
 const ICONS = ['👤', '🐱', '🐶', '🐾', '🐴', '🌸', '⭐', '💜', '🏡', '💼'];
 const newId = () => 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+/* A restore that was stopped or failed can leave a half-filled database behind (if the helper still had it open).
+   Such databases are remembered and removed later, when nothing is running. */
+async function markPending(db, on) {
+  const l = new Set(await PR.getSetting('pendingRestoreDbs', [])); on ? l.add(db) : l.delete(db); await PR.setSetting('pendingRestoreDbs', [...l]);
+}
+async function cleanupPending() {
+  if (S.busy) return setTimeout(cleanupPending, 10000);
+  const l = await PR.getSetting('pendingRestoreDbs', []).catch(() => []); if (!l.length) return;
+  const keep = [];
+  for (const db of l) { if (S.profiles.some(p => p.db === db)) continue; const ok = await LCA.deleteDatabase(db).then(() => true, () => false); if (!ok) keep.push(db); }
+  if (indexedDB.databases) { try { const now = (await indexedDB.databases()).map(x => x.name); for (const db of l) if (now.includes(db) && !keep.includes(db) && !S.profiles.some(p => p.db === db)) keep.push(db); } catch (e) { } }
+  await PR.setSetting('pendingRestoreDbs', keep);
+}
 async function initProfiles() {
   let list = await PR.all();
   if (!list.length) {
@@ -1025,7 +1105,8 @@ async function initProfiles() {
     if (indexedDB.databases) {
       try {
         let order = 1;
-        for (const x of await indexedDB.databases()) if (x.name && x.name.startsWith(LCA.PROFILE_DB_PREFIX)) {
+        const pend = await PR.getSetting('pendingRestoreDbs', []);
+        for (const x of await indexedDB.databases()) if (x.name && x.name.startsWith(LCA.PROFILE_DB_PREFIX) && !pend.includes(x.name)) {
           const R = LCA.at(x.name);
           await PR.put({ id: x.name.slice(LCA.PROFILE_DB_PREFIX.length), name: (await R.getMeta('profileName', null)) || 'Recovered profile', icon: (await R.getMeta('profileIcon', null)) || '👤', db: x.name, createdAt: Date.now(), order: order++ });
         }
@@ -1071,9 +1152,12 @@ const statsLine = (st) => !st.threads && !st.friends && !st.groups && !st.pages 
   `${fmtN(st.threads)} conversations · ${fmtN(st.messages)} messages · ${fmtN(st.media)} media files (${fmtBytes(st.mediaBytes)}) · ${fmtN(st.friends)} people · ${fmtN(st.groups)} groups · ${fmtN(st.pages)} pages`;
 /* bottom sheet */
 const fill = (box, ...kids) => box.append(...kids.flat(Infinity).filter(k => k != null && k !== false));
+const openSheets = new Set();
 function sheet(build, onClose) {
   const bg = h('div', { class: 'sheet-bg' }); const box = h('div', { class: 'sheet', role: 'dialog', 'aria-modal': 'true' });
-  const close = () => { bg.remove(); document.removeEventListener('keydown', esc_); if (onClose) onClose(); };
+  let closed = false;
+  const close = () => { if (closed) return; closed = true; openSheets.delete(close); bg.remove(); document.removeEventListener('keydown', esc_); if (onClose) onClose(); };
+  openSheets.add(close);
   const esc_ = (e) => { if (e.key === 'Escape') close(); };
   bg.addEventListener('click', (e) => { if (e.target === bg) close(); }); document.addEventListener('keydown', esc_);
   bg.append(box); document.body.append(bg); build(box, close); return close;
@@ -1177,12 +1261,18 @@ async function nameSuggestionCard() {
 }
 /* ---------- restore ---------- */
 async function restoreFlow(file) {
-  if (S.busy) return toast('Please wait until the import / backup has finished');
-  let info;
-  S.busy = true; drawProfileBtn();
-  try { setProgress('Reading backup', 0, 1); info = await runWorker({ type: 'inspectBackup', file }); }
-  catch (e) { alert('Could not read the backup: ' + e.message); return; }
-  finally { S.busy = false; drawProfileBtn(); }
+  if (S.busy) return toast('Please wait – something is still running (or tap Stop)');
+  if (!location.hash.startsWith('#/import')) location.hash = '#/import';
+  let info, job = beginJob('restore');
+  try {
+    setProgress('Reading backup', 0, 1, `${file.name || 'backup'} (${fmtBytes(file.size)})`);
+    file = await readableZip(file, 1, 1, 'Reading backup');
+    setProgress('Reading backup', 0, 1, 'Reading the list of files inside the backup…');
+    info = await runWorker({ type: 'inspectBackup', file });
+  } catch (e) {
+    if (!isStopped(job)) { console.error(e); setProgress('Could not read the backup', 0, 1, e.message); showError('Could not read the backup', e.message); alert('Could not read the backup: ' + e.message); }
+    return;
+  } finally { endJob(job); }
   const ps = info.profiles.map((x, i) => Object.assign(x, { label: x.name || x.meta?.profileName || x.meta?.ownerFromProfile || (info.profiles.length > 1 ? `Restored profile ${i + 1}` : 'Restored backup') }));
   const desc = (x) => `${x.label}: ${fmtN(x.stores?.threads || 0)} conversations, ${fmtN(x.stores?.messages || 0)} messages, ${fmtN(x.stores?.media || 0)} media files`;
   const when = info.createdAt ? ` from ${fmtDT(info.createdAt)}` : '';
@@ -1197,17 +1287,17 @@ async function restoreFlow(file) {
   if (!choice) return;
   if (choice === 'replace' && !confirm(`Replace everything in “${S.profile.name}” with the backup? Other profiles are not touched.`)) return;
   if (choice === 'replaceAll' && !confirm(`Replace ALL profiles on this device with the ${ps.length} profiles from the backup? Profiles that are not in the backup will be deleted.`)) return;
-  S.busy = true; drawProfileBtn(); showProgBox();
+  job = beginJob('restore');
   const done = [];
   try {
     // each profile is restored into a fresh database first; old data is removed only after that succeeded
     for (let i = 0; i < ps.length; i++) {
       const x = ps[i], id = newId(), db = LCA.PROFILE_DB_PREFIX + id;
       setProgress(`Restoring “${x.label}” (${i + 1} of ${ps.length})`, 0, 1);
-      done.push({ x, id, db });
+      checkStop(); done.push({ x, id, db }); await markPending(db, true);
       await runWorker({ type: 'restore', file, prefix: x.dir || '', db });
     }
-    stopWorker(); S.xcache.clear();
+    stopWorker(); checkStop(); S.xcache.clear();
     const old = S.profiles.slice();
     if (choice === 'replace') {
       const P = S.profile, oldDb = P.db;
@@ -1229,15 +1319,17 @@ async function restoreFlow(file) {
         S.profiles = await PR.all();
       }
     }
+    for (const d of done) await markPending(d.db, false);
     await PR.setSetting('current', S.profile.id);
     resetProfileView(); await loadState(true); drawProfileBtn();
     setProgress('Backup restored', 1, 1, done.map(d => d.x.label).join(' · ')); toast('Backup restored');
   } catch (e) {
-    console.error(e); stopWorker();
-    for (const d of done) if (!S.profiles.some(p => p.db === d.db)) await LCA.deleteDatabase(d.db).catch(() => {});
-    alert('Restore failed: ' + e.message + '\n\nNothing on this device was replaced.');
-  } finally { S.busy = false; drawProfileBtn(); }
-  if (location.hash.startsWith('#/import')) { const note = $('#progNote')?.textContent; await render(); setProgress('Backup restored', 1, 1, note); } else location.hash = '#/messenger';
+    stopWorker();
+    for (const d of done) if (!S.profiles.some(p => p.db === d.db)) { await LCA.deleteDatabase(d.db).catch(() => {}); setTimeout(cleanupPending, 8000); }
+    if (!isStopped(job)) { console.error(e); setProgress('Restore failed', 0, 1, e.message + ' – nothing on this device was replaced.'); showError('Restore failed', e.message + '\n\nNothing on this device was replaced.'); alert('Restore failed: ' + e.message + '\n\nNothing on this device was replaced.'); }
+    return;
+  } finally { endJob(job); }
+  if (location.hash.startsWith('#/import')) await render(); else location.hash = '#/import';
 }
 function uniqueName(n, list) { let out = n, k = 2; while (list.some(p => normName(p.name) === normName(out))) out = `${n} (${k++})`; return out; }
 
@@ -1246,13 +1338,16 @@ if (!$('#profBtn')) { const b = h('button', { type: 'button', id: 'profBtn', cla
 $('#profBtn').addEventListener('click', () => openProfileSheet());
 if ('serviceWorker' in navigator && location.protocol !== 'file:') {
   navigator.serviceWorker.register('sw.js').catch(e => console.warn('SW', e));
-  // when a new version takes over, load it (never in the middle of an import – then offer it afterwards)
-  const hadController = !!navigator.serviceWorker.controller; let reloading = false;
+  // A new version is loaded right away only when that cannot disturb anything: the app is on screen and idle, and no
+  // file was picked in the last minute. Otherwise (e.g. coming back from the file picker, or during an import) a banner offers “Reload”.
+  const hadController = !!navigator.serviceWorker.controller;
   navigator.serviceWorker.addEventListener('controllerchange', () => {
-    if (!hadController || reloading) return;
-    if (S.busy) { S.updateWaiting = true; return; }
-    reloading = true; location.reload();
+    if (!hadController) return;
+    S.updateWaiting = true;
+    if (!S.busy && document.visibilityState === 'visible' && Date.now() - (S.pickedAt || 0) > 60000 && !document.querySelector('.sheet')) location.reload();
+    else if (!S.busy) updateBanner();
   });
+  document.addEventListener('change', (e) => { if (e.target && e.target.type === 'file') S.pickedAt = Date.now(); }, true);
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') navigator.serviceWorker.getRegistration().then(r => r && r.update()).catch(() => { }); });
 }
 (async () => {
@@ -1265,6 +1360,7 @@ if ('serviceWorker' in navigator && location.protocol !== 'file:') {
   sessionStorage.removeItem('lca-reloaded');
   try { await initProfiles(); await LCA.openDB(); } catch (e) { view.append(h('div', { class: 'note' }, 'This browser cannot store the archive (IndexedDB unavailable – private browsing?). ' + e.message)); return; }
   drawProfileBtn();
+  cleanupPending().catch(e => console.warn(e));
   await loadState(true);
   if (!location.hash) { location.replace('#/' + (S.threads.length || S.report ? 'messenger' : 'import')); }
   render();
